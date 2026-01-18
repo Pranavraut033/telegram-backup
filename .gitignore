@@ -51,6 +51,7 @@ coverage.xml
 # dotenv
 .env
 .env.*
+!.env.example
 
 # VS Code
 .vscode/
