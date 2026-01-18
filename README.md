@@ -219,7 +219,22 @@ macOS may block downloaded, unsigned binaries with Gatekeeper. If you run into "
   ```
 
 - Notes on notarization and signing:
-  - Signed and notarized builds will pass Gatekeeper automatically. If you distribute macOS binaries widely, consider signing and notarizing releases (codesign + xcrun notarytool + stapler) in your Release workflow.
+  - Signed and notarized builds will pass Gatekeeper automatically. If you distribute macOS binaries widely, consider signing and notarizing releases (codesign + xcrun notarytool + stapler) in your Build workflow.
+
+  - Required GitHub Secrets (for automated signing & notarization):
+    - `APPLE_IDENTITY_P12` — Base64-encoded `.p12` of your **Developer ID Application** certificate (private key included).
+    - `APPLE_IDENTITY_P12_PASSWORD` — Password used to export the `.p12` (if any).
+    - `APPLE_SIGNING_IDENTITY` — The identity string used by `codesign` (e.g., `Developer ID Application: Your Name (TEAMID)`).
+    - `APPLE_API_KEY_ID` — App Store Connect API key ID (the Key ID of the AuthKey .p8)
+    - `APPLE_API_ISSUER_ID` — App Store Connect Issuer ID (the Issuer ID for your API key).
+    - `APPLE_API_PRIVATE_KEY` — Base64-encoded `.p8` private key (AuthKey_<KEYID>.p8) used by `notarytool`.
+
+  - How it works (summary): the macOS runner imports your `.p12` certificate into a temporary keychain, `codesign`s the built binary with the provided identity, packages the artifact (zip), submits it to Apple's notarization service via `xcrun notarytool`, waits for notarization to complete, and then `staple`s the notarization ticket to the binary so Gatekeeper accepts it.
+
+  - Security notes:
+    - Keep these secrets in the repository settings (Repository > Settings > Secrets) and **do not** commit certificate files into the repo.
+    - Test signing & notarization in a private branch first; if notarization fails the Build job will show the notarytool output and fail.
+
   - Avoid disabling Gatekeeper globally (e.g., `spctl --master-disable`) — this reduces system security and is not recommended.
 
 ---

@@ -29,6 +29,50 @@ jobs:
       - name: Build executable
         run: |
           pyinstaller --onefile main.py --name telegram-backup
+
+      - name: macOS: Code sign
+        if: matrix.os == 'macos-latest'
+        env:
+          APPLE_IDENTITY_P12: ${{ secrets.APPLE_IDENTITY_P12 }}
+          APPLE_IDENTITY_P12_PASSWORD: ${{ secrets.APPLE_IDENTITY_P12_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          echo "Preparing keychain and importing identity..."
+          echo "$APPLE_IDENTITY_P12" | base64 --decode > apple_identity.p12
+          security create-keychain -p "" build_signing.keychain
+          security import apple_identity.p12 -k build_signing.keychain -P "$APPLE_IDENTITY_P12_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -s build_signing.keychain
+          security default-keychain -s build_signing.keychain
+          security unlock-keychain -p "" build_signing.keychain
+          security set-keychain-settings -t 3600 -u build_signing.keychain
+
+          echo "Signing the binary with: $APPLE_SIGNING_IDENTITY"
+          ls -l dist || true
+          codesign --timestamp --options runtime --sign "$APPLE_SIGNING_IDENTITY" dist/telegram-backup || true
+          spctl -a -vvv dist/telegram-backup || true
+
+      - name: macOS: Notarize and staple
+        if: matrix.os == 'macos-latest'
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          echo "Preparing API key for notarytool..."
+          echo "$APPLE_API_PRIVATE_KEY" | base64 --decode > AuthKey_${APPLE_API_KEY_ID}.p8
+
+          echo "Creating package for notarization (zip)..."
+          ditto -c -k --sequesterRsrc --keepParent dist/telegram-backup telegram-backup-macos.zip
+
+          echo "Submitting to Apple notarization service..."
+          xcrun notarytool submit telegram-backup-macos.zip --key AuthKey_${APPLE_API_KEY_ID}.p8 --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --wait
+
+          echo "Stapling notarization ticket to binary..."
+          xcrun stapler staple dist/telegram-backup
+          xcrun stapler validate -v dist/telegram-backup || true
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
