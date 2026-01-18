@@ -1,0 +1,431 @@
+"""
+Media download logic with progress tracking
+"""
+import os
+import asyncio
+from datetime import datetime
+from telethon.errors import FloodWaitError
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, DownloadColumn, TransferSpeedColumn, TaskID
+from rich.console import Console
+from rich.table import Table
+from rich.live import Live
+from rich.panel import Panel
+import time
+import config
+import utils
+from state_manager import StateManager
+
+console = Console(width=120) # Set a fixed width for consistent output
+
+def log_debug(message):
+    """Print debug message if DEBUG is enabled"""
+    if config.DEBUG:
+        console.log(f"[DEBUG] {message}")
+
+
+class MediaDownloader:
+    def _init_state_manager(self, chat_name):
+        chat_dir = utils.create_directory(
+            os.path.join(self.output_dir, utils.sanitize_dirname(chat_name))
+        )
+        state_file = os.path.join(self.output_dir, f".backup_state_{StateManager(self.output_dir, chat_name)._sanitize_for_filename(chat_name)}.json")
+        self.state_manager = StateManager(self.output_dir, chat_name)
+        # If state file does not exist, generate it from existing files
+        if not os.path.exists(state_file):
+            console.print(f"[bold yellow]⚠️  No state file found. Generating state from existing files in backup folder...[/bold yellow]")
+            self.state_manager.generate_state_from_existing_files(chat_dir)
+            console.print(f"[green]State file generated. Ready to resume backup.[/green]")
+        if self.state_manager.is_resuming():
+            resume_info = self.state_manager.get_resume_info()
+            console.print(f"\n[bold blue]🔄 Resuming previous backup...[/bold blue]")
+            console.print(f"   Started: [yellow]{resume_info['started_at'][:19]}[/yellow]")
+            console.print(f"   Last updated: [yellow]{resume_info['last_updated'][:19] if resume_info['last_updated'] else 'N/A'}[/yellow]")
+            console.print(f"   Already downloaded: [green]{resume_info['downloaded']}[/green] files")
+            console.print(f"   [bold blue]📋 Validating existing files...[/bold blue]")
+            corrupted_count = 0
+            if isinstance(self.state_manager.state['downloaded_messages'], dict):
+                for msg_id in list(self.state_manager.state['downloaded_messages'].keys()):
+                    if not self.state_manager.validate_downloaded_file(msg_id):
+                        corrupted_count += 1
+                        del self.state_manager.state['downloaded_messages'][msg_id]
+            if corrupted_count > 0:
+                console.print(f"   [bold yellow]⚠️  Found {corrupted_count} missing or corrupted files - will re-download[/bold yellow]")
+            state_stats = self.state_manager.get_stats()
+            self.stats['downloaded'] = state_stats['downloaded']
+            self.stats['skipped'] = state_stats['skipped']
+            self.stats['errors'] = state_stats['failed']
+        return chat_dir
+
+    def _init_progress_bars(self, label="Overall Progress"):
+        """Initialize and return overall and file progress bars and group for Live context."""
+        from rich.console import Group
+        self.overall_progress = Progress(
+            TextColumn(f"[bold blue]{label}:") if label else TextColumn("[bold blue]Progress:"),
+            BarColumn(bar_width=40),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("[cyan]{task.completed}/{task.total}"),
+            TextColumn("[green]✓{task.fields[downloaded]}[/green]"),
+            TextColumn("[yellow]⊙{task.fields[skipped]}[/yellow]"),
+            TextColumn("[red]✗{task.fields[errors]}[/red]"),
+            TimeElapsedColumn(),
+            console=console,
+            refresh_per_second=10
+        )
+        self.file_progress = Progress(
+            TextColumn("[bold cyan]Current File:"),
+            TextColumn("[green]{task.description}"),
+            BarColumn(bar_width=40),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            console=console,
+            refresh_per_second=10
+        )
+        progress_group = Group(
+            Panel(self.overall_progress, border_style="blue"),
+            self.file_progress
+        )
+        return progress_group
+    def __init__(self, client, media_filter, output_dir):
+        self.client = client
+        self.media_filter = media_filter
+        self.output_dir = output_dir
+        self.state_manager = None
+        self.progress_bar = None
+        self.task_id = None
+        self.overall_progress = None
+        self.file_progress = None
+        self.current_file_task = None
+        self.stats = {
+            'downloaded': 0,
+            'skipped': 0,
+            'errors': 0,
+            'total_bytes': 0
+        }
+    
+    async def auto_rename_old_topic_folders(self, entity, chat_dir):
+        """If chat is a forum, fetch topics and rename old topic folders automatically."""
+        from topic_handler import TopicHandler
+        topic_handler = TopicHandler(self.client)
+        is_forum = await topic_handler.is_forum(entity)
+        if is_forum:
+            topics = await topic_handler.get_topics(entity)
+            renamed = utils.rename_old_topic_folders(chat_dir, topics)
+            if renamed:
+                console.print(f"[bold cyan]📁 Migrated {len(renamed)} old topic folder(s) to new names[/bold cyan]\n")
+
+    async def download_from_chat(self, entity, chat_name, limit=None, date_from=None, date_to=None):
+        """Download media from a chat"""
+        log_debug(f"Starting download from chat: {chat_name}")
+        chat_dir = utils.create_directory(
+            os.path.join(self.output_dir, utils.sanitize_dirname(chat_name))
+        )
+        log_debug(f"Output directory: {chat_dir}")
+        
+        # Automatically rename old topic folders if this is a forum
+        await self.auto_rename_old_topic_folders(entity, chat_dir)
+
+        # Initialize state manager
+        self.state_manager = StateManager(self.output_dir, chat_name)
+        
+        # Check if resuming
+        if self.state_manager.is_resuming():
+            resume_info = self.state_manager.get_resume_info()
+            console.print(f"\n[bold blue]� Resuming previous backup...[/bold blue]")
+            console.print(f"   Started: [yellow]{resume_info['started_at'][:19]}[/yellow]")
+            console.print(f"   Last updated: [yellow]{resume_info['last_updated'][:19] if resume_info['last_updated'] else 'N/A'}[/yellow]")
+            console.print(f"   Already downloaded: [green]{resume_info['downloaded']}[/green] files")
+            console.print(f"   [bold blue]📋 Validating existing files...[/bold blue]")
+            
+            # Validate and count corrupted files
+            corrupted_count = 0
+            if isinstance(self.state_manager.state['downloaded_messages'], dict):
+                for msg_id in list(self.state_manager.state['downloaded_messages'].keys()):
+                    if not self.state_manager.validate_downloaded_file(msg_id):
+                        corrupted_count += 1
+                        # Remove from downloaded list so it gets re-downloaded
+                        del self.state_manager.state['downloaded_messages'][msg_id]
+            
+            if corrupted_count > 0:
+                console.print(f"   [bold yellow]⚠️  Found {corrupted_count} missing or corrupted files - will re-download[/bold yellow]")
+            
+            # Load previous stats
+            state_stats = self.state_manager.get_stats()
+            self.stats['downloaded'] = state_stats['downloaded']
+            self.stats['skipped'] = state_stats['skipped']
+            self.stats['errors'] = state_stats['failed']
+        
+        console.print(f"\n[bold cyan]📥 Downloading media from:[/bold cyan] {chat_name}")
+        console.print(f"[bold cyan]📁 Output directory:[/bold cyan] {chat_dir}")
+        
+        # Determine total messages for the progress bar
+        console.print(f"[bold magenta]🔍 Scanning messages to count total media...[/bold magenta]")
+        total_media_messages = 0
+        async for message in self.client.iter_messages(entity, limit=limit, offset_date=date_to, reverse=False):
+            if date_from and message.date < date_from:
+                continue
+            if date_to and message.date > date_to:
+                continue
+            if self.media_filter.is_media_message(message) and not self.state_manager.validate_downloaded_file(message.id):
+                total_media_messages += 1
+        console.print(f"[green]Found {total_media_messages} new or corrupted media messages to process.[/green]\n")
+
+        # Initialize progress bars using helper
+        progress_group = self._init_progress_bars("Overall Progress")
+        with Live(progress_group, console=console, refresh_per_second=10):
+            self.progress_bar = self.overall_progress
+            self.task_id = self.overall_progress.add_task(
+                "Processing...",
+                total=total_media_messages,
+                downloaded=self.stats['downloaded'],
+                skipped=self.stats['skipped'],
+                errors=self.stats['errors']
+            )
+
+            message_processed_count = 0
+            async for message in self.client.iter_messages(
+                entity,
+                limit=limit,
+                offset_date=date_to,
+                reverse=False
+            ):
+                if date_from and message.date < date_from:
+                    continue
+                if date_to and message.date > date_to:
+                    continue
+                
+                message_processed_count += 1
+
+                # If already downloaded and validated, just update progress bar
+                if self.state_manager.validate_downloaded_file(message.id):
+                    log_debug(f"Skipping already downloaded message {message.id}")
+                    self._update_progress(downloaded=1, advance=0) # Only update stats, not advance task
+                    continue
+                
+                if self.state_manager.is_message_skipped(message.id):
+                    log_debug(f"Skipping previously skipped message {message.id}")
+                    self._update_progress(skipped=1, advance=0) # Only update stats, not advance task
+                    continue
+                
+                if self.media_filter.should_download(message):
+                    await self._download_media(message, chat_dir)
+            
+            # Ensure final state is updated even if some messages were skipped by iter_messages limit
+            self.overall_progress.update(self.task_id, completed=total_media_messages)
+
+        self.state_manager.mark_completed()
+        self._print_summary(chat_name, message_processed_count)
+    
+    async def download_from_topic(self, entity, topic_id, topic_name, chat_dir, limit=None):
+        """Download media from a forum topic, with progress bar"""
+        # Ensure state manager is initialized for the parent chat (DRY)
+        if not self.state_manager or self.state_manager.chat_name != os.path.basename(chat_dir):
+            self._init_state_manager(os.path.basename(chat_dir))
+        topic_dir = utils.create_directory(
+            os.path.join(chat_dir, utils.sanitize_dirname(topic_name))
+        )
+        console.print(f"  [bold magenta]📋 Topic:[/bold magenta] {topic_name}")
+        console.print(f"     [dim]Scanning messages to count total media...[/dim]")
+
+        # Count total media messages in topic
+        total_media_messages = 0
+        async for message in self.client.iter_messages(entity, limit=limit, reply_to=topic_id):
+            if self.media_filter.is_media_message(message) and not (self.state_manager and self.state_manager.validate_downloaded_file(message.id)):
+                total_media_messages += 1
+
+        console.print(f"     [bold blue]Total media messages:[/bold blue] {total_media_messages}")
+
+        # Setup progress bars using helper
+        progress_group = self._init_progress_bars("Topic Progress")
+        message_processed_count = 0
+        media_count = 0
+        with Live(progress_group, console=console, refresh_per_second=10):
+            self.progress_bar = self.overall_progress
+            self.task_id = self.overall_progress.add_task(
+                "Processing...",
+                total=total_media_messages,
+                downloaded=self.stats['downloaded'],
+                skipped=self.stats['skipped'],
+                errors=self.stats['errors']
+            )
+
+            async for message in self.client.iter_messages(
+                entity,
+                limit=limit,
+                reply_to=topic_id
+            ):
+                message_processed_count += 1
+                if self.state_manager and self.state_manager.validate_downloaded_file(message.id):
+                    self._update_progress(downloaded=1, advance=0)
+                    continue
+                if self.state_manager and self.state_manager.is_message_skipped(message.id):
+                    self._update_progress(skipped=1, advance=0)
+                    continue
+                if self.media_filter.should_download(message):
+                    media_count += 1
+                    await self._download_media(message, topic_dir)
+            # Ensure final state is updated
+            self.overall_progress.update(self.task_id, completed=total_media_messages)
+
+        console.print(f"     Processed {message_processed_count} messages ({media_count} with media)")
+    
+    async def _download_media(self, message, directory):
+        """Download media from a single message"""
+        retries = 0
+
+        # Use media_filter to get a safe filename, fallback to message id
+        if hasattr(self, 'media_filter') and hasattr(self.media_filter, 'get_filename'):
+            filename = utils.sanitize_filename(self.media_filter.get_filename(message) or f"media_{message.id}")
+        else:
+            filename = utils.sanitize_filename(f"media_{message.id}")
+
+        intended_path = os.path.join(directory, filename)
+        file_exists_on_disk = os.path.exists(intended_path)
+        file_info = None
+        if self.state_manager:
+            file_info = self.state_manager.state.get('downloaded_messages', {}).get(str(message.id))
+
+        # If file exists on disk but not tracked, add it to state
+        if file_exists_on_disk and (not file_info or not self.state_manager.validate_downloaded_file(message.id)):
+            file_size = os.path.getsize(intended_path)
+            self.state_manager.state['downloaded_messages'][str(message.id)] = {
+                'filename': filename,
+                'size': file_size,
+                'path': intended_path
+            }
+            self.state_manager._save_state()
+            log_debug(f"File {filename} found on disk and added to state. Skipping download.")
+            return
+
+        # If file is tracked and valid, skip download
+        if file_info and file_info.get('path') and self.state_manager.validate_downloaded_file(message.id):
+            log_debug(f"File already downloaded and valid: {filename}, skipping download.")
+            return
+
+        # Otherwise, generate a unique filepath (may have _1 if file exists but not valid)
+        filepath = utils.get_unique_filepath(directory, filename)
+
+        def progress_callback(current, total):
+            if self.file_progress and self.current_file_task is not None:
+                self.file_progress.update(self.current_file_task, completed=current, total=total)
+
+        while retries < config.MAX_RETRIES:
+            try:
+                # Add file download task
+                if self.file_progress:
+                    self.current_file_task = self.file_progress.add_task(
+                        filename,
+                        total=0
+                    )
+
+                # Download media with progress callback
+                result = await self.client.download_media(
+                    message.media,
+                    file=filepath,
+                    progress_callback=progress_callback
+                )
+
+                # Remove file task after completion
+                if self.file_progress and self.current_file_task is not None:
+                    self.file_progress.remove_task(self.current_file_task)
+                    self.current_file_task = None
+
+                if result:
+                    file_size = os.path.getsize(result) if os.path.exists(result) else 0
+                    # Validate download (check for incomplete files)
+                    if file_size == 0:
+                        log_debug(f"Downloaded file is empty: {filename}")
+                        if os.path.exists(result):
+                            os.remove(result)
+                        retries += 1
+                        await asyncio.sleep(config.RETRY_DELAY)
+                        continue
+                    self.stats['downloaded'] += 1
+                    self.stats['total_bytes'] += file_size
+                    if self.state_manager:
+                        self.state_manager.mark_downloaded(message.id, result, file_size)
+                    log_debug(f"Successfully downloaded: {filename} ({utils.format_bytes(file_size)})")
+                    self._update_progress(downloaded=1)
+                else:
+                    self.stats['skipped'] += 1
+                    if self.state_manager:
+                        self.state_manager.mark_skipped(message.id)
+                    log_debug(f"Skipped: {filename} (no media)")
+                    self._update_progress(skipped=1)
+                return
+
+            except FloodWaitError as e:
+                wait_time = e.seconds
+                log_debug(f"Rate limited. Waiting {wait_time}s...")
+                if self.file_progress and self.current_file_task is not None:
+                    self.file_progress.remove_task(self.current_file_task)
+                    self.current_file_task = None
+                await asyncio.sleep(wait_time)
+                retries += 1
+
+            except Exception as e:
+                error_msg = str(e)
+                if self.file_progress and self.current_file_task is not None:
+                    self.file_progress.remove_task(self.current_file_task)
+                    self.current_file_task = None
+
+                if "FILE_REFERENCE" in error_msg:
+                    self.stats['skipped'] += 1
+                    if self.state_manager:
+                        self.state_manager.mark_skipped(message.id)
+                    log_debug(f"Skipped: {filename} (file reference expired)")
+                    self._update_progress(skipped=1)
+                    return
+
+                retries += 1
+                if retries >= config.MAX_RETRIES:
+                    self.stats['errors'] += 1
+                    if self.state_manager:
+                        self.state_manager.mark_failed(message.id)
+                    error_short = error_msg[:60] + "..." if len(error_msg) > 60 else error_msg
+                    log_debug(f"Error: {filename} - {error_short}")
+                    self._update_progress(errors=1)
+                    return
+
+                await asyncio.sleep(config.RETRY_DELAY)
+    
+    def _update_progress(self, downloaded=0, skipped=0, errors=0, advance=1):
+        """Update the progress bar"""
+        if self.overall_progress and self.task_id is not None:
+            self.overall_progress.update(
+                self.task_id,
+                advance=advance,
+                downloaded=self.stats['downloaded'],
+                skipped=self.stats['skipped'],
+                errors=self.stats['errors']
+            )
+    
+    def _print_summary(self, chat_name, message_count):
+        """Print download summary"""
+        console.print()
+        
+        table = Table(title="📊 Download Summary", show_header=False, box=None)
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="bold")
+        
+        table.add_row("Chat", chat_name)
+        table.add_row("Messages scanned", str(message_count))
+        table.add_row("✓ Downloaded", f"[green]{self.stats['downloaded']}[/green] files")
+        table.add_row("⊙ Skipped", f"[yellow]{self.stats['skipped']}[/yellow] files")
+        table.add_row("✗ Errors", f"[red]{self.stats['errors']}[/red] files")
+        table.add_row("📦 Total size", utils.format_bytes(self.stats['total_bytes']))
+        
+        console.print(table)
+        console.print()
+
+    def get_stats(self):
+        """Return download statistics"""
+        return self.stats.copy()
+    
+    def reset_stats(self):
+        """Reset statistics"""
+        self.stats = {
+            'downloaded': 0,
+            'skipped': 0,
+            'errors': 0,
+            'total_bytes': 0
+        }
