@@ -134,6 +134,69 @@ Notes:
 - Use `--help` to see available options (e.g., `--debug`, `--logout`).
 - Always run builds from official releases or CI artifacts to ensure integrity.
 
+### Running the executable
+
+Follow these steps to set up the environment and run the downloaded executable:
+
+1. Create a `.env` file (recommended)
+
+   ```bash
+   cp .env.example .env
+   # Edit .env and set API_ID, API_HASH, etc.
+   ```
+
+   Example `.env`:
+
+   ```dotenv
+   API_ID=123456
+   API_HASH=your_api_hash_here
+   SESSION_NAME=telegram_backup_session
+   DEFAULT_OUTPUT_DIR=./telegram_media_backup
+   DEFAULT_MESSAGE_LIMIT=
+   ```
+
+2. Where to place `.env`
+
+- Place `.env` next to the executable or run the executable from the directory containing `.env`. The program uses `python-dotenv` to load variables from the current working directory.
+
+3. Alternative: set environment variables directly
+
+- macOS / Linux:
+  ```bash
+  export API_ID=123456
+  export API_HASH=your_api_hash
+  ./telegram-backup
+  ```
+
+- Windows PowerShell:
+  ```powershell
+  $env:API_ID="123456"
+  $env:API_HASH="your_api_hash"
+  .\telegram-backup.exe
+  ```
+
+4. Run the executable
+
+- macOS / Linux:
+  ```bash
+  chmod +x telegram-backup
+  ./telegram-backup --help
+  ./telegram-backup
+  ```
+
+- Windows (PowerShell / CMD):
+  ```powershell
+  .\telegram-backup.exe --help
+  .\telegram-backup.exe
+  ```
+
+5. Notes & troubleshooting
+
+- A session file (`<SESSION_NAME>.session`) will be created in the working directory—keep it secure and do **not** commit it.
+- If the executable complains about missing credentials, verify that `.env` is present in the current directory or that you exported the environment variables in the shell you are running.
+- Use `--debug` for verbose logs.
+- For automated runs (systemd, services, CI), set environment variables in the service/unit or use an environment file.
+
 ---
 
 ## Features
