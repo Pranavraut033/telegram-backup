@@ -104,6 +104,36 @@ This project uses **GitHub Actions** to automatically build and package executab
 - `.github/workflows/build.yml` — builds executables for all OSes
 - `.github/workflows/release.yml` — creates a release and uploads builds
 
+### Using downloaded build artifacts
+
+You can download the built executables either from the GitHub Actions run artifacts (Build job) or from a Release (created by the Release workflow):
+
+- From a Release: go to the repository Releases page, find the tag you want and download the attached `telegram-backup` asset for your platform (Windows builds will be `telegram-backup.exe`, macOS/Linux builds are single-file executables).
+
+- From an Actions run: open the Build workflow run, expand the Build job, and download the artifact named `telegram-backup-<platform>`.
+
+Once downloaded, run the executable for your platform:
+
+- macOS / Linux:
+  ```bash
+  # If the binary is zipped, unzip first, then:
+  chmod +x telegram-backup
+  ./telegram-backup --help
+  ./telegram-backup  # runs the backup CLI
+  ```
+
+- Windows (PowerShell / CMD):
+  ```powershell
+  # Download telegram-backup.exe from the release or artifacts
+  .\telegram-backup.exe --help
+  .\telegram-backup.exe
+  ```
+
+Notes:
+- The executables are built with PyInstaller as single-file binaries and may be zipped by Actions when uploaded; extract before running if needed.
+- Use `--help` to see available options (e.g., `--debug`, `--logout`).
+- Always run builds from official releases or CI artifacts to ensure integrity.
+
 ---
 
 ## Features
