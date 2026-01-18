@@ -197,6 +197,31 @@ Follow these steps to set up the environment and run the downloaded executable:
 - Use `--debug` for verbose logs.
 - For automated runs (systemd, services, CI), set environment variables in the service/unit or use an environment file.
 
+### macOS — Gatekeeper & security notes 🔒
+
+macOS may block downloaded, unsigned binaries with Gatekeeper. If you run into "unidentified developer" or "can't be opened" errors, follow one of these safe options:
+
+- GUI (recommended for non-technical users):
+  1. Attempt to open the app by double-clicking (you may see a warning).
+  2. Open System Settings → Privacy & Security (or System Preferences → Security & Privacy on older macOS).
+  3. Under **Security**, click **Open Anyway** for the blocked app, then confirm **Open** in the dialog.
+
+- Terminal (power users):
+  ```bash
+  # Make the file executable (if needed)
+  chmod +x ./telegram-backup
+
+  # Remove the download quarantine attribute (marks the file as trusted)
+  xattr -d com.apple.quarantine ./telegram-backup
+
+  # Check Gatekeeper status (accepted => allowed; rejected => blocked)
+  spctl -a -v ./telegram-backup
+  ```
+
+- Notes on notarization and signing:
+  - Signed and notarized builds will pass Gatekeeper automatically. If you distribute macOS binaries widely, consider signing and notarizing releases (codesign + xcrun notarytool + stapler) in your Release workflow.
+  - Avoid disabling Gatekeeper globally (e.g., `spctl --master-disable`) — this reduces system security and is not recommended.
+
 ---
 
 ## Features
