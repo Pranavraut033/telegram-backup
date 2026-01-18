@@ -1,5 +1,7 @@
 # Telegram Media Backup
 
+[![Build](https://github.com/Pranavraut033/telegram-backup/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/Pranavraut033/telegram-backup/actions/workflows/build.yml) [![Release](https://github.com/Pranavraut033/telegram-backup/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/Pranavraut033/telegram-backup/actions/workflows/release.yml) [![Python](https://img.shields.io/badge/python-3.7%2B-blue)](https://www.python.org/) [![Issues](https://img.shields.io/github/issues/Pranavraut033/telegram-backup)](https://github.com/Pranavraut033/telegram-backup/issues)
+
 CLI tool for backing up media from Telegram chats and groups using the Telegram Client API.
 
 ---
