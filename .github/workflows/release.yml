@@ -8,19 +8,54 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name to release (e.g. v1.2.3). Optional when dispatching manually; if omitted and the workflow was triggered by a tag push the pushed tag will be used.'
+        required: false
+        default: ''
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist/
+        continue-on-error: true
+
+      - name: Determine tag
+        id: determine_tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "tag_name=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "tag_name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "tag_name=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check for build artifacts
+        run: |
+          count=$(ls -1 dist/**/telegram-backup* 2>/dev/null | wc -l || true)
+          if [ "$count" -eq 0 ]; then
+            echo "Error: No build artifacts found in dist/. Ensure the Build workflow has run and uploaded artifacts before releasing."
+            exit 1
+          fi
+
       - name: Create Release
+        if: steps.determine_tag.outputs.tag_name != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.determine_tag.outputs.tag_name }}
           files: dist/**/telegram-backup*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fail if no tag provided
+        if: steps.determine_tag.outputs.tag_name == ''
+        run: |
+          echo "Error: No tag provided. For workflow_dispatch provide 'tag' input, or trigger this workflow by pushing a tag (refs/tags/*)."
+          exit 1
