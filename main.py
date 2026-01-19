@@ -21,8 +21,9 @@ import utils
 console = Console()
 
 class TelegramMediaBackup:
-    def __init__(self, debug=False):
+    def __init__(self, debug=False, simple_mode=False):
         config.DEBUG = debug
+        self.simple_mode = simple_mode
         self.client_manager = TelegramClientManager()
         self.client = None
         
@@ -34,7 +35,7 @@ class TelegramMediaBackup:
         try:
             console.print(Panel(
                 "[bold green]TELEGRAM MEDIA BACKUP[/bold green]\n" +
-                "[dim]Options: --logout to sign out, --debug for verbose logging[/dim]",
+                "[dim]Options: --logout to sign out, --debug for verbose logging, --simple for simple log output[/dim]",
                 expand=False,
                 border_style="blue"
             ))
@@ -71,7 +72,7 @@ class TelegramMediaBackup:
             # Set up main components
             media_filter = MediaFilter(media_types)
             topic_handler = TopicHandler(self.client)
-            downloader = MediaDownloader(self.client, media_filter, output_dir, max_file_size=max_file_size)
+            downloader = MediaDownloader(self.client, media_filter, output_dir, max_file_size=max_file_size, simple_mode=self.simple_mode)
 
             # Download from forum or regular chat
             is_forum = await topic_handler.is_forum(dialog.entity)
@@ -264,11 +265,15 @@ def main():
         return
     
     debug = '--debug' in sys.argv or '--verbose' in sys.argv or '-v' in sys.argv
+    simple_mode = '--simple' in sys.argv or '--no-progress' in sys.argv
     
     if debug:
         console.print("[bold yellow]Starting in DEBUG mode...[/bold yellow]\n")
     
-    backup = TelegramMediaBackup(debug=debug)
+    if simple_mode:
+        console.print("[bold cyan]Using simple logging mode (progress bars disabled)...[/bold cyan]\n")
+    
+    backup = TelegramMediaBackup(debug=debug, simple_mode=simple_mode)
     asyncio.run(backup.run())
 
 

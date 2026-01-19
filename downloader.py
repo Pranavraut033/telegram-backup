@@ -85,11 +85,12 @@ class MediaDownloader:
             self.file_progress
         )
         return progress_group
-    def __init__(self, client, media_filter, output_dir, max_file_size=None):
+    def __init__(self, client, media_filter, output_dir, max_file_size=None, simple_mode=False):
         self.client = client
         self.media_filter = media_filter
         self.output_dir = output_dir
         self.max_file_size = max_file_size  # in bytes, None = no limit
+        self.simple_mode = simple_mode  # if True, use simple logging instead of progress bars
         self.state_manager = None
         self.progress_bar = None
         self.task_id = None
@@ -171,18 +172,9 @@ class MediaDownloader:
                 total_media_messages += 1
         console.print(f"[green]Found {total_media_messages} new or corrupted media messages to process.[/green]\n")
 
-        # Initialize progress bars using helper
-        progress_group = self._init_progress_bars("Overall Progress")
-        with Live(progress_group, console=console, refresh_per_second=10):
-            self.progress_bar = self.overall_progress
-            self.task_id = self.overall_progress.add_task(
-                "Processing...",
-                total=total_media_messages,
-                downloaded=self.stats['downloaded'],
-                skipped=self.stats['skipped'],
-                errors=self.stats['errors']
-            )
-
+        # Process messages with or without progress bars
+        if self.simple_mode:
+            # Simple logging mode
             message_processed_count = 0
             async for message in self.client.iter_messages(
                 entity,
@@ -197,22 +189,60 @@ class MediaDownloader:
                 
                 message_processed_count += 1
 
-                # If already downloaded and validated, just update progress bar
                 if self.state_manager.validate_downloaded_file(message.id):
                     log_debug(f"Skipping already downloaded message {message.id}")
-                    self._update_progress(downloaded=1, advance=0) # Only update stats, not advance task
+                    self._update_progress(downloaded=1, advance=0)
                     continue
                 
                 if self.state_manager.is_message_skipped(message.id):
                     log_debug(f"Skipping previously skipped message {message.id}")
-                    self._update_progress(skipped=1, advance=0) # Only update stats, not advance task
+                    self._update_progress(skipped=1, advance=0)
                     continue
                 
                 if self.media_filter.should_download(message):
                     await self._download_media(message, chat_dir)
-            
-            # Ensure final state is updated even if some messages were skipped by iter_messages limit
-            self.overall_progress.update(self.task_id, completed=total_media_messages)
+        else:
+            # Progress bar mode
+            progress_group = self._init_progress_bars("Overall Progress")
+            with Live(progress_group, console=console, refresh_per_second=10):
+                self.progress_bar = self.overall_progress
+                self.task_id = self.overall_progress.add_task(
+                    "Processing...",
+                    total=total_media_messages,
+                    downloaded=self.stats['downloaded'],
+                    skipped=self.stats['skipped'],
+                    errors=self.stats['errors']
+                )
+
+                message_processed_count = 0
+                async for message in self.client.iter_messages(
+                    entity,
+                    limit=limit,
+                    offset_date=date_to,
+                    reverse=False
+                ):
+                    if date_from and message.date < date_from:
+                        continue
+                    if date_to and message.date > date_to:
+                        continue
+                    
+                    message_processed_count += 1
+
+                    if self.state_manager.validate_downloaded_file(message.id):
+                        log_debug(f"Skipping already downloaded message {message.id}")
+                        self._update_progress(downloaded=1, advance=0)
+                        continue
+                    
+                    if self.state_manager.is_message_skipped(message.id):
+                        log_debug(f"Skipping previously skipped message {message.id}")
+                        self._update_progress(skipped=1, advance=0)
+                        continue
+                    
+                    if self.media_filter.should_download(message):
+                        await self._download_media(message, chat_dir)
+                
+                # Ensure final state is updated
+                self.overall_progress.update(self.task_id, completed=total_media_messages)
 
         self.state_manager.mark_completed()
         self._print_summary(chat_name, message_processed_count)
@@ -236,20 +266,11 @@ class MediaDownloader:
 
         console.print(f"     [bold blue]Total media messages:[/bold blue] {total_media_messages}")
 
-        # Setup progress bars using helper
-        progress_group = self._init_progress_bars("Topic Progress")
         message_processed_count = 0
         media_count = 0
-        with Live(progress_group, console=console, refresh_per_second=10):
-            self.progress_bar = self.overall_progress
-            self.task_id = self.overall_progress.add_task(
-                "Processing...",
-                total=total_media_messages,
-                downloaded=self.stats['downloaded'],
-                skipped=self.stats['skipped'],
-                errors=self.stats['errors']
-            )
-
+        
+        if self.simple_mode:
+            # Simple logging mode
             async for message in self.client.iter_messages(
                 entity,
                 limit=limit,
@@ -265,8 +286,36 @@ class MediaDownloader:
                 if self.media_filter.should_download(message):
                     media_count += 1
                     await self._download_media(message, topic_dir)
-            # Ensure final state is updated
-            self.overall_progress.update(self.task_id, completed=total_media_messages)
+        else:
+            # Progress bar mode
+            progress_group = self._init_progress_bars("Topic Progress")
+            with Live(progress_group, console=console, refresh_per_second=10):
+                self.progress_bar = self.overall_progress
+                self.task_id = self.overall_progress.add_task(
+                    "Processing...",
+                    total=total_media_messages,
+                    downloaded=self.stats['downloaded'],
+                    skipped=self.stats['skipped'],
+                    errors=self.stats['errors']
+                )
+
+                async for message in self.client.iter_messages(
+                    entity,
+                    limit=limit,
+                    reply_to=topic_id
+                ):
+                    message_processed_count += 1
+                    if self.state_manager and self.state_manager.validate_downloaded_file(message.id):
+                        self._update_progress(downloaded=1, advance=0)
+                        continue
+                    if self.state_manager and self.state_manager.is_message_skipped(message.id):
+                        self._update_progress(skipped=1, advance=0)
+                        continue
+                    if self.media_filter.should_download(message):
+                        media_count += 1
+                        await self._download_media(message, topic_dir)
+                # Ensure final state is updated
+                self.overall_progress.update(self.task_id, completed=total_media_messages)
 
         console.print(f"     Processed {message_processed_count} messages ({media_count} with media)")
     
@@ -324,8 +373,10 @@ class MediaDownloader:
 
         while retries < config.MAX_RETRIES:
             try:
-                # Add file download task
-                if self.file_progress:
+                # Add file download task or log start
+                if self.simple_mode:
+                    console.print(f"[cyan]📥 Downloading:[/cyan] {filename} (msg {message.id})")
+                elif self.file_progress:
                     self.current_file_task = self.file_progress.add_task(
                         filename,
                         total=0
@@ -335,7 +386,7 @@ class MediaDownloader:
                 result = await self.client.download_media(
                     message.media,
                     file=filepath,
-                    progress_callback=progress_callback
+                    progress_callback=progress_callback if not self.simple_mode else None
                 )
 
                 # Remove file task after completion
@@ -358,6 +409,8 @@ class MediaDownloader:
                     if self.state_manager:
                         self.state_manager.mark_downloaded(message.id, result, file_size)
                     log_debug(f"Successfully downloaded: {filename} ({utils.format_bytes(file_size)})")
+                    if self.simple_mode:
+                        console.print(f"[green]✓ Downloaded:[/green] {filename} ({utils.format_bytes(file_size)})")
                     self._update_progress(downloaded=1)
                 else:
                     self.stats['skipped'] += 1
