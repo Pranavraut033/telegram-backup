@@ -4,7 +4,7 @@ Media download logic with progress tracking
 import os
 import asyncio
 from datetime import datetime
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, RPCError
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, DownloadColumn, TransferSpeedColumn, TaskID
 from rich.console import Console
 from rich.table import Table
@@ -260,9 +260,17 @@ class MediaDownloader:
 
         # Count total media messages in topic
         total_media_messages = 0
-        async for message in self.client.iter_messages(entity, limit=limit, reply_to=topic_id):
-            if self.media_filter.is_media_message(message) and not (self.state_manager and self.state_manager.validate_downloaded_file(message.id)):
-                total_media_messages += 1
+        try:
+            async for message in self.client.iter_messages(entity, limit=limit, reply_to=topic_id):
+                if self.media_filter.is_media_message(message) and not (self.state_manager and self.state_manager.validate_downloaded_file(message.id)):
+                    total_media_messages += 1
+        except RPCError as e:
+            if 'TOPIC_ID_INVALID' in str(e):
+                console.print(f"     [bold red]❌ Error: Invalid topic ID. Skipping this topic.[/bold red]")
+                return
+            else:
+                console.print(f"     [bold red]❌ Error accessing topic: {e}. Skipping this topic.[/bold red]")
+                return
 
         console.print(f"     [bold blue]Total media messages:[/bold blue] {total_media_messages}")
 
@@ -271,34 +279,7 @@ class MediaDownloader:
         
         if self.simple_mode:
             # Simple logging mode
-            async for message in self.client.iter_messages(
-                entity,
-                limit=limit,
-                reply_to=topic_id
-            ):
-                message_processed_count += 1
-                if self.state_manager and self.state_manager.validate_downloaded_file(message.id):
-                    self._update_progress(downloaded=1, advance=0)
-                    continue
-                if self.state_manager and self.state_manager.is_message_skipped(message.id):
-                    self._update_progress(skipped=1, advance=0)
-                    continue
-                if self.media_filter.should_download(message):
-                    media_count += 1
-                    await self._download_media(message, topic_dir)
-        else:
-            # Progress bar mode
-            progress_group = self._init_progress_bars("Topic Progress")
-            with Live(progress_group, console=console, refresh_per_second=10):
-                self.progress_bar = self.overall_progress
-                self.task_id = self.overall_progress.add_task(
-                    "Processing...",
-                    total=total_media_messages,
-                    downloaded=self.stats['downloaded'],
-                    skipped=self.stats['skipped'],
-                    errors=self.stats['errors']
-                )
-
+            try:
                 async for message in self.client.iter_messages(
                     entity,
                     limit=limit,
@@ -314,8 +295,41 @@ class MediaDownloader:
                     if self.media_filter.should_download(message):
                         media_count += 1
                         await self._download_media(message, topic_dir)
-                # Ensure final state is updated
-                self.overall_progress.update(self.task_id, completed=total_media_messages)
+            except RPCError as e:
+                console.print(f"     [bold red]❌ Error downloading from topic: {e}. Skipping.[/bold red]")
+        else:
+            # Progress bar mode
+            progress_group = self._init_progress_bars("Topic Progress")
+            with Live(progress_group, console=console, refresh_per_second=10):
+                self.progress_bar = self.overall_progress
+                self.task_id = self.overall_progress.add_task(
+                    "Processing...",
+                    total=total_media_messages,
+                    downloaded=self.stats['downloaded'],
+                    skipped=self.stats['skipped'],
+                    errors=self.stats['errors']
+                )
+
+                try:
+                    async for message in self.client.iter_messages(
+                        entity,
+                        limit=limit,
+                        reply_to=topic_id
+                    ):
+                        message_processed_count += 1
+                        if self.state_manager and self.state_manager.validate_downloaded_file(message.id):
+                            self._update_progress(downloaded=1, advance=0)
+                            continue
+                        if self.state_manager and self.state_manager.is_message_skipped(message.id):
+                            self._update_progress(skipped=1, advance=0)
+                            continue
+                        if self.media_filter.should_download(message):
+                            media_count += 1
+                            await self._download_media(message, topic_dir)
+                    # Ensure final state is updated
+                    self.overall_progress.update(self.task_id, completed=total_media_messages)
+                except RPCError as e:
+                    console.print(f"     [bold red]❌ Error downloading from topic: {e}. Skipping.[/bold red]")
 
         console.print(f"     Processed {message_processed_count} messages ({media_count} with media)")
     
