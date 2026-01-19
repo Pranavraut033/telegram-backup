@@ -85,10 +85,11 @@ class MediaDownloader:
             self.file_progress
         )
         return progress_group
-    def __init__(self, client, media_filter, output_dir):
+    def __init__(self, client, media_filter, output_dir, max_file_size=None):
         self.client = client
         self.media_filter = media_filter
         self.output_dir = output_dir
+        self.max_file_size = max_file_size  # in bytes, None = no limit
         self.state_manager = None
         self.progress_bar = None
         self.task_id = None
@@ -99,7 +100,8 @@ class MediaDownloader:
             'downloaded': 0,
             'skipped': 0,
             'errors': 0,
-            'total_bytes': 0
+            'total_bytes': 0,
+            'skipped_size': 0  # track files skipped due to size
         }
     
     async def auto_rename_old_topic_folders(self, entity, chat_dir):
@@ -272,6 +274,18 @@ class MediaDownloader:
         """Download media from a single message"""
         retries = 0
 
+        # Check file size limit before downloading
+        if self.max_file_size is not None:
+            file_size = self._get_media_size(message)
+            if file_size and file_size > self.max_file_size:
+                if self.state_manager:
+                    self.state_manager.mark_skipped(message.id)
+                self.stats['skipped'] += 1
+                self.stats['skipped_size'] += 1
+                log_debug(f"Skipped message {message.id}: file size {utils.format_bytes(file_size)} exceeds limit {utils.format_bytes(self.max_file_size)}")
+                self._update_progress(skipped=1)
+                return
+
         # Use media_filter to get a safe filename, fallback to message id
         if hasattr(self, 'media_filter') and hasattr(self.media_filter, 'get_filename'):
             filename = utils.sanitize_filename(self.media_filter.get_filename(message) or f"media_{message.id}")
@@ -388,6 +402,19 @@ class MediaDownloader:
 
                 await asyncio.sleep(config.RETRY_DELAY)
     
+    def _get_media_size(self, message):
+        """Get file size from message media"""
+        try:
+            if hasattr(message, 'media'):
+                if hasattr(message.media, 'document') and message.media.document:
+                    return message.media.document.size
+                elif hasattr(message.media, 'photo') and message.media.photo:
+                    # Photos don't have direct size, return None to allow download
+                    return None
+        except Exception:
+            pass
+        return None
+
     def _update_progress(self, downloaded=0, skipped=0, errors=0, advance=1):
         """Update the progress bar"""
         if self.overall_progress and self.task_id is not None:
@@ -411,6 +438,8 @@ class MediaDownloader:
         table.add_row("Messages scanned", str(message_count))
         table.add_row("✓ Downloaded", f"[green]{self.stats['downloaded']}[/green] files")
         table.add_row("⊙ Skipped", f"[yellow]{self.stats['skipped']}[/yellow] files")
+        if self.stats.get('skipped_size', 0) > 0:
+            table.add_row("  ↳ Too large", f"[dim yellow]{self.stats['skipped_size']}[/dim yellow] files")
         table.add_row("✗ Errors", f"[red]{self.stats['errors']}[/red] files")
         table.add_row("📦 Total size", utils.format_bytes(self.stats['total_bytes']))
         

@@ -64,13 +64,14 @@ class TelegramMediaBackup:
                 console.print("[bold red]No media types selected. Exiting.[/bold red]")
                 return
             message_limit = self._prompt_message_limit()
+            max_file_size = self._prompt_max_file_size()
             date_range = self._prompt_date_range()
             output_dir = self._prompt_output_directory()
 
             # Set up main components
             media_filter = MediaFilter(media_types)
             topic_handler = TopicHandler(self.client)
-            downloader = MediaDownloader(self.client, media_filter, output_dir)
+            downloader = MediaDownloader(self.client, media_filter, output_dir, max_file_size=max_file_size)
 
             # Download from forum or regular chat
             is_forum = await topic_handler.is_forum(dialog.entity)
@@ -178,6 +179,41 @@ class TelegramMediaBackup:
             return limit if limit > 0 else None
         except ValueError:
             console.print("[yellow]Invalid input. Using no limit.[/yellow]")
+            return None
+    
+    def _prompt_max_file_size(self):
+        """
+        Prompt user for max file size to download.
+        Returns size in bytes or None for no limit.
+        """
+        console.print("\n[bold yellow]=== Max File Size ===[/bold yellow]")
+        console.print("Skip files larger than specified size (e.g., 100MB, 2GB)")
+        choice = Prompt.ask("[bold cyan]Enter max file size (press Enter for no limit)[/bold cyan]", default="").strip()
+        
+        if not choice:
+            return None
+        
+        try:
+            # Parse size with unit (e.g., "100MB", "2GB", "500KB")
+            choice = choice.upper().replace(" ", "")
+            
+            if choice.endswith("GB"):
+                size_value = float(choice[:-2])
+                return int(size_value * 1024 * 1024 * 1024)
+            elif choice.endswith("MB"):
+                size_value = float(choice[:-2])
+                return int(size_value * 1024 * 1024)
+            elif choice.endswith("KB"):
+                size_value = float(choice[:-2])
+                return int(size_value * 1024)
+            elif choice.endswith("B"):
+                return int(float(choice[:-1]))
+            else:
+                # Assume MB if no unit specified
+                size_value = float(choice)
+                return int(size_value * 1024 * 1024)
+        except (ValueError, IndexError):
+            console.print("[yellow]Invalid input. Using no size limit.[/yellow]")
             return None
     
     def _prompt_date_range(self):
