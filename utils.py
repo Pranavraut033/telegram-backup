@@ -119,7 +119,64 @@ def format_duration(seconds):
         return f"{seconds/3600:.1f}h"
 
 
+def fix_file_extension_case(filepath):
+    """
+    Fix file extension case if needed (e.g., .MP4 -> .mp4).
+    Returns the new path if renamed, or original path if no change needed.
+    """
+    if not os.path.exists(filepath):
+        return filepath
+    
+    directory, filename = os.path.split(filepath)
+    name, ext = os.path.splitext(filename)
+    
+    # Check if extension has uppercase letters
+    if ext and ext != ext.lower():
+        new_filename = name + ext.lower()
+        new_filepath = os.path.join(directory, new_filename)
+        
+        # Only rename if the new path doesn't already exist
+        if not os.path.exists(new_filepath):
+            try:
+                os.rename(filepath, new_filepath)
+                return new_filepath
+            except Exception:
+                # If rename fails, return original
+                return filepath
+    
+    return filepath
+
+
+def fix_extensions_in_directory(directory, state_manager=None):
+    """
+    Scan directory for files with uppercase extensions and rename them to lowercase.
+    Returns count of files renamed.
+    Optionally updates state_manager if provided.
+    """
+    if not os.path.exists(directory):
+        return 0
+    
+    renamed_count = 0
+    
+    for item in os.listdir(directory):
+        item_path = os.path.join(directory, item)
+        
+        if os.path.isfile(item_path):
+            new_path = fix_file_extension_case(item_path)
+            if new_path != item_path:
+                renamed_count += 1
+                # Update state manager if provided
+                if state_manager:
+                    state_manager.update_file_path(item_path, new_path)
+        elif os.path.isdir(item_path):
+            # Recursively fix extensions in subdirectories
+            renamed_count += fix_extensions_in_directory(item_path, state_manager)
+    
+    return renamed_count
+
+
 def rename_old_topic_folders(chat_dir, topics):
+
     """
     Rename old topic folders from 'Topic #number' format to actual topic names.
     Returns a dict mapping old paths to new paths.

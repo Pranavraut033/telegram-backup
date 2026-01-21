@@ -63,13 +63,14 @@ class MediaFilter:
                 
                 # Check MIME type
                 if doc.mime_type:
-                    if doc.mime_type.startswith('image/'):
+                    mime_lower = doc.mime_type.lower()
+                    if mime_lower.startswith('image/'):
                         return "sticker" if any(
                             hasattr(attr, 'stickerset') for attr in doc.attributes
                         ) else "photo"
-                    elif doc.mime_type.startswith('video/'):
+                    elif mime_lower.startswith('video/'):
                         return "video"
-                    elif doc.mime_type.startswith('audio/'):
+                    elif mime_lower.startswith('audio/'):
                         return "audio"
             
             return "document"
@@ -96,7 +97,10 @@ class MediaFilter:
             if doc and hasattr(doc, 'attributes'):
                 for attr in doc.attributes:
                     if isinstance(attr, DocumentAttributeFilename):
-                        return attr.file_name
+                        # Normalize extension to lowercase
+                        filename = attr.file_name
+                        name, ext = filename.rsplit('.', 1) if '.' in filename else (filename, '')
+                        return f"{name}.{ext.lower()}" if ext else filename
             
             # Generate filename based on type
             media_type = self._get_media_type(media)
@@ -126,4 +130,4 @@ class MediaFilter:
             'application/zip': '.zip',
         }
         
-        return mime_map.get(mime_type, '')
+        return mime_map.get(mime_type.lower(), '')

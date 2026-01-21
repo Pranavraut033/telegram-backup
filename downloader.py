@@ -127,8 +127,14 @@ class MediaDownloader:
         # Automatically rename old topic folders if this is a forum
         await self.auto_rename_old_topic_folders(entity, chat_dir)
 
-        # Initialize state manager
+        # Initialize state manager first
         self.state_manager = StateManager(self.output_dir, chat_name)
+        
+        # Fix existing files with wrong extension case and update state
+        renamed_count = utils.fix_extensions_in_directory(chat_dir, self.state_manager)
+        if renamed_count > 0:
+            console.print(f"[bold cyan]📝 Fixed {renamed_count} file(s) with uppercase extensions[/bold cyan]\n")
+
         
         # Check if resuming
         if self.state_manager.is_resuming():

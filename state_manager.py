@@ -150,7 +150,21 @@ class StateManager:
         """
         return message_id in self.state['failed_messages']
     
+    def update_file_path(self, old_path, new_path):
+        """
+        Update file path in state when a file is renamed.
+        """
+        if isinstance(self.state['downloaded_messages'], dict):
+            for msg_id, file_info in self.state['downloaded_messages'].items():
+                if file_info.get('path') == old_path:
+                    file_info['path'] = new_path
+                    file_info['filename'] = os.path.basename(new_path)
+                    self._save_state()
+                    return True
+        return False
+    
     def mark_downloaded(self, message_id, file_path=None, file_size=0):
+
         """
         Mark a message as successfully downloaded, with file info.
         """
