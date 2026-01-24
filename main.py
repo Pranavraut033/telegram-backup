@@ -67,6 +67,7 @@ class TelegramMediaBackup:
             message_limit = self._prompt_message_limit()
             max_file_size = self._prompt_max_file_size()
             date_range = self._prompt_date_range()
+            sort_by = self._prompt_sorting()
             output_dir = self._prompt_output_directory()
 
             # Set up main components
@@ -77,14 +78,15 @@ class TelegramMediaBackup:
             # Download from forum or regular chat
             is_forum = await topic_handler.is_forum(dialog.entity)
             if is_forum:
-                await self._download_forum_media(dialog, topic_handler, downloader, message_limit)
+                await self._download_forum_media(dialog, topic_handler, downloader, message_limit, sort_by)
             else:
                 await downloader.download_from_chat(
                     dialog.entity,
                     dialog.name,
                     limit=message_limit,
                     date_from=date_range[0],
-                    date_to=date_range[1]
+                    date_to=date_range[1],
+                    sort_by=sort_by
                 )
             # Summary is printed by downloader now  
         except KeyboardInterrupt:
@@ -95,7 +97,7 @@ class TelegramMediaBackup:
         finally:
             await self.client_manager.disconnect()
     
-    async def _download_forum_media(self, dialog, topic_handler, downloader, limit):
+    async def _download_forum_media(self, dialog, topic_handler, downloader, limit, sort_by):
         """
         Download media from a forum chat, handling topics if present.
         """
@@ -134,7 +136,8 @@ class TelegramMediaBackup:
                     topic_id,
                     topic_name,
                     chat_dir,
-                    limit=limit
+                    limit=limit,
+                    sort_by=sort_by
                 )
     
     def _prompt_media_types(self):
@@ -253,6 +256,16 @@ class TelegramMediaBackup:
             console.print(f"[bold red]Cannot create directory: {e}[/bold red]")
             console.print(f"[yellow]Using default: {config.DEFAULT_OUTPUT_DIR}[/yellow]")
             return config.DEFAULT_OUTPUT_DIR
+
+    def _prompt_sorting(self):
+        """Prompt for optional sorting preference"""
+        console.print("\n[bold yellow]=== Sorting (Optional) ===[/bold yellow]")
+        console.print("1. Default (by date)")
+        console.print("2. Most reactions first")
+        choice = Prompt.ask("[bold cyan]Choose sorting (1/2)[/bold cyan]", default="1").strip()
+        if choice == "2":
+            return "reactions_desc"
+        return None
 
 
 def main():

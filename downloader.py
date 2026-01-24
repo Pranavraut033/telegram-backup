@@ -116,7 +116,7 @@ class MediaDownloader:
             if renamed:
                 console.print(f"[bold cyan]📁 Migrated {len(renamed)} old topic folder(s) to new names[/bold cyan]\n")
 
-    async def download_from_chat(self, entity, chat_name, limit=None, date_from=None, date_to=None):
+    async def download_from_chat(self, entity, chat_name, limit=None, date_from=None, date_to=None, sort_by=None):
         """Download media from a chat"""
         log_debug(f"Starting download from chat: {chat_name}")
         chat_dir = utils.create_directory(
@@ -166,22 +166,11 @@ class MediaDownloader:
         console.print(f"\n[bold cyan]📥 Downloading media from:[/bold cyan] {chat_name}")
         console.print(f"[bold cyan]📁 Output directory:[/bold cyan] {chat_dir}")
         
-        # Determine total messages for the progress bar
-        console.print(f"[bold magenta]🔍 Scanning messages to count total media...[/bold magenta]")
-        total_media_messages = 0
-        async for message in self.client.iter_messages(entity, limit=limit, offset_date=date_to, reverse=False):
-            if date_from and message.date < date_from:
-                continue
-            if date_to and message.date > date_to:
-                continue
-            if self.media_filter.is_media_message(message) and not self.state_manager.validate_downloaded_file(message.id):
-                total_media_messages += 1
-        console.print(f"[green]Found {total_media_messages} new or corrupted media messages to process.[/green]\n")
-
-        # Process messages with or without progress bars
-        if self.simple_mode:
-            # Simple logging mode
-            message_processed_count = 0
+        # If sorting by reactions, pre-collect and sort candidates
+        candidates = None
+        if sort_by == "reactions_desc":
+            console.print(f"[bold magenta]🔍 Scanning and collecting messages for reaction-based sorting...[/bold magenta]")
+            candidates = []
             async for message in self.client.iter_messages(
                 entity,
                 limit=limit,
@@ -192,35 +181,53 @@ class MediaDownloader:
                     continue
                 if date_to and message.date > date_to:
                     continue
-                
-                message_processed_count += 1
-
                 if self.state_manager.validate_downloaded_file(message.id):
-                    log_debug(f"Skipping already downloaded message {message.id}")
-                    self._update_progress(downloaded=1, advance=0)
                     continue
-                
                 if self.state_manager.is_message_skipped(message.id):
-                    log_debug(f"Skipping previously skipped message {message.id}")
-                    self._update_progress(skipped=1, advance=0)
                     continue
-                
                 if self.media_filter.should_download(message):
-                    await self._download_media(message, chat_dir)
-        else:
-            # Progress bar mode
-            progress_group = self._init_progress_bars("Overall Progress")
-            with Live(progress_group, console=console, refresh_per_second=10):
-                self.progress_bar = self.overall_progress
-                self.task_id = self.overall_progress.add_task(
-                    "Processing...",
-                    total=total_media_messages,
-                    downloaded=self.stats['downloaded'],
-                    skipped=self.stats['skipped'],
-                    errors=self.stats['errors']
-                )
+                    candidates.append(message)
 
-                message_processed_count = 0
+            def _reaction_count(msg):
+                try:
+                    reactions = getattr(msg, 'reactions', None)
+                    if not reactions:
+                        return 0
+                    results = getattr(reactions, 'results', None)
+                    if results:
+                        return sum(getattr(r, 'count', 0) for r in results)
+                    recent = getattr(reactions, 'recent_reactions', None)
+                    if recent:
+                        return len(recent)
+                    return 0
+                except Exception:
+                    return 0
+
+            candidates.sort(key=_reaction_count, reverse=True)
+            total_media_messages = len(candidates)
+            console.print(f"[green]Found {total_media_messages} media messages after filtering and sorting.[/green]\n")
+        else:
+            # Determine total messages for the progress bar
+            console.print(f"[bold magenta]🔍 Scanning messages to count total media...[/bold magenta]")
+            total_media_messages = 0
+            async for message in self.client.iter_messages(entity, limit=limit, offset_date=date_to, reverse=False):
+                if date_from and message.date < date_from:
+                    continue
+                if date_to and message.date > date_to:
+                    continue
+                if self.media_filter.is_media_message(message) and not self.state_manager.validate_downloaded_file(message.id):
+                    total_media_messages += 1
+            console.print(f"[green]Found {total_media_messages} new or corrupted media messages to process.[/green]\n")
+
+        # Process messages with or without progress bars
+        if self.simple_mode:
+            # Simple logging mode
+            message_processed_count = 0
+            if candidates is not None:
+                for message in candidates:
+                    message_processed_count += 1
+                    await self._download_media(message, chat_dir)
+            else:
                 async for message in self.client.iter_messages(
                     entity,
                     limit=limit,
@@ -246,6 +253,49 @@ class MediaDownloader:
                     
                     if self.media_filter.should_download(message):
                         await self._download_media(message, chat_dir)
+        else:
+            # Progress bar mode
+            progress_group = self._init_progress_bars("Overall Progress")
+            with Live(progress_group, console=console, refresh_per_second=10):
+                self.progress_bar = self.overall_progress
+                self.task_id = self.overall_progress.add_task(
+                    "Processing...",
+                    total=total_media_messages,
+                    downloaded=self.stats['downloaded'],
+                    skipped=self.stats['skipped'],
+                    errors=self.stats['errors']
+                )
+                message_processed_count = 0
+                if candidates is not None:
+                    for message in candidates:
+                        message_processed_count += 1
+                        await self._download_media(message, chat_dir)
+                else:
+                    async for message in self.client.iter_messages(
+                        entity,
+                        limit=limit,
+                        offset_date=date_to,
+                        reverse=False
+                    ):
+                        if date_from and message.date < date_from:
+                            continue
+                        if date_to and message.date > date_to:
+                            continue
+                        
+                        message_processed_count += 1
+
+                        if self.state_manager.validate_downloaded_file(message.id):
+                            log_debug(f"Skipping already downloaded message {message.id}")
+                            self._update_progress(downloaded=1, advance=0)
+                            continue
+                        
+                        if self.state_manager.is_message_skipped(message.id):
+                            log_debug(f"Skipping previously skipped message {message.id}")
+                            self._update_progress(skipped=1, advance=0)
+                            continue
+                        
+                        if self.media_filter.should_download(message):
+                            await self._download_media(message, chat_dir)
                 
                 # Ensure final state is updated
                 self.overall_progress.update(self.task_id, completed=total_media_messages)
@@ -253,7 +303,7 @@ class MediaDownloader:
         self.state_manager.mark_completed()
         self._print_summary(chat_name, message_processed_count)
     
-    async def download_from_topic(self, entity, topic_id, topic_name, chat_dir, limit=None):
+    async def download_from_topic(self, entity, topic_id, topic_name, chat_dir, limit=None, sort_by=None):
         """Download media from a forum topic, with progress bar"""
         # Ensure state manager is initialized for the parent chat (DRY)
         if not self.state_manager or self.state_manager.chat_name != os.path.basename(chat_dir):
@@ -264,12 +314,41 @@ class MediaDownloader:
         console.print(f"  [bold magenta]📋 Topic:[/bold magenta] {topic_name}")
         console.print(f"     [dim]Scanning messages to count total media...[/dim]")
 
-        # Count total media messages in topic
+        # Collect or count media messages in topic
         total_media_messages = 0
+        candidates = None
         try:
-            async for message in self.client.iter_messages(entity, limit=limit, reply_to=topic_id):
-                if self.media_filter.is_media_message(message) and not (self.state_manager and self.state_manager.validate_downloaded_file(message.id)):
-                    total_media_messages += 1
+            if sort_by == "reactions_desc":
+                candidates = []
+                async for message in self.client.iter_messages(entity, limit=limit, reply_to=topic_id):
+                    if self.state_manager and self.state_manager.validate_downloaded_file(message.id):
+                        continue
+                    if self.state_manager and self.state_manager.is_message_skipped(message.id):
+                        continue
+                    if self.media_filter.should_download(message):
+                        candidates.append(message)
+
+                def _reaction_count(msg):
+                    try:
+                        reactions = getattr(msg, 'reactions', None)
+                        if not reactions:
+                            return 0
+                        results = getattr(reactions, 'results', None)
+                        if results:
+                            return sum(getattr(r, 'count', 0) for r in results)
+                        recent = getattr(reactions, 'recent_reactions', None)
+                        if recent:
+                            return len(recent)
+                        return 0
+                    except Exception:
+                        return 0
+
+                candidates.sort(key=_reaction_count, reverse=True)
+                total_media_messages = len(candidates)
+            else:
+                async for message in self.client.iter_messages(entity, limit=limit, reply_to=topic_id):
+                    if self.media_filter.is_media_message(message) and not (self.state_manager and self.state_manager.validate_downloaded_file(message.id)):
+                        total_media_messages += 1
         except RPCError as e:
             if 'TOPIC_ID_INVALID' in str(e):
                 console.print(f"     [bold red]❌ Error: Invalid topic ID. Skipping this topic.[/bold red]")
@@ -286,21 +365,27 @@ class MediaDownloader:
         if self.simple_mode:
             # Simple logging mode
             try:
-                async for message in self.client.iter_messages(
-                    entity,
-                    limit=limit,
-                    reply_to=topic_id
-                ):
-                    message_processed_count += 1
-                    if self.state_manager and self.state_manager.validate_downloaded_file(message.id):
-                        self._update_progress(downloaded=1, advance=0)
-                        continue
-                    if self.state_manager and self.state_manager.is_message_skipped(message.id):
-                        self._update_progress(skipped=1, advance=0)
-                        continue
-                    if self.media_filter.should_download(message):
+                if candidates is not None:
+                    for message in candidates:
+                        message_processed_count += 1
                         media_count += 1
                         await self._download_media(message, topic_dir)
+                else:
+                    async for message in self.client.iter_messages(
+                        entity,
+                        limit=limit,
+                        reply_to=topic_id
+                    ):
+                        message_processed_count += 1
+                        if self.state_manager and self.state_manager.validate_downloaded_file(message.id):
+                            self._update_progress(downloaded=1, advance=0)
+                            continue
+                        if self.state_manager and self.state_manager.is_message_skipped(message.id):
+                            self._update_progress(skipped=1, advance=0)
+                            continue
+                        if self.media_filter.should_download(message):
+                            media_count += 1
+                            await self._download_media(message, topic_dir)
             except RPCError as e:
                 console.print(f"     [bold red]❌ Error downloading from topic: {e}. Skipping.[/bold red]")
         else:
@@ -317,21 +402,27 @@ class MediaDownloader:
                 )
 
                 try:
-                    async for message in self.client.iter_messages(
-                        entity,
-                        limit=limit,
-                        reply_to=topic_id
-                    ):
-                        message_processed_count += 1
-                        if self.state_manager and self.state_manager.validate_downloaded_file(message.id):
-                            self._update_progress(downloaded=1, advance=0)
-                            continue
-                        if self.state_manager and self.state_manager.is_message_skipped(message.id):
-                            self._update_progress(skipped=1, advance=0)
-                            continue
-                        if self.media_filter.should_download(message):
+                    if candidates is not None:
+                        for message in candidates:
+                            message_processed_count += 1
                             media_count += 1
                             await self._download_media(message, topic_dir)
+                    else:
+                        async for message in self.client.iter_messages(
+                            entity,
+                            limit=limit,
+                            reply_to=topic_id
+                        ):
+                            message_processed_count += 1
+                            if self.state_manager and self.state_manager.validate_downloaded_file(message.id):
+                                self._update_progress(downloaded=1, advance=0)
+                                continue
+                            if self.state_manager and self.state_manager.is_message_skipped(message.id):
+                                self._update_progress(skipped=1, advance=0)
+                                continue
+                            if self.media_filter.should_download(message):
+                                media_count += 1
+                                await self._download_media(message, topic_dir)
                     # Ensure final state is updated
                     self.overall_progress.update(self.task_id, completed=total_media_messages)
                 except RPCError as e:
