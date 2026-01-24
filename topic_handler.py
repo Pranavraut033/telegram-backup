@@ -3,6 +3,13 @@ Forum topic detection and handling for Telegram backup.
 Helps identify and process forum topics in chats.
 """
 from telethon.tl.types import Channel
+import config
+
+
+def log_debug(message):
+    """Print debug message if DEBUG is enabled"""
+    if config.DEBUG:
+        print(f"[DEBUG] {message}")
 
 
 class TopicHandler:
@@ -24,24 +31,15 @@ class TopicHandler:
         """
         Fetch all topics from a forum chat.
         Returns a list of topic objects or dicts.
+        Note: GetForumTopicsRequest is not available in this version of Telethon,
+        so we use the fallback message scanning method.
         """
         if not await self.is_forum(entity):
             return []
-        topics = []
-        try:
-            # Use GetForumTopicsRequest for forum topics
-            result = await self.client(GetForumTopicsRequest(
-                channel=entity,
-                offset_date=None,
-                offset_id=0,
-                offset_topic=0,
-                limit=100
-            ))
-            for topic in result.topics:
-                topics.append(topic)
-        except Exception:
-            # Fallback: scan messages for topics
-            topics = await self._extract_topics_from_messages(entity)
+        
+        log_debug("Fetching topics from forum (using message scanning)")
+        # Use message scanning fallback since GetForumTopicsRequest is not available
+        topics = await self._extract_topics_from_messages(entity)
         return topics
 
     async def _extract_topics_from_messages(self, entity):
@@ -51,26 +49,40 @@ class TopicHandler:
         """
         topics_dict = {}
         try:
+            log_debug("Extracting topics from messages")
             async for message in self.client.iter_messages(entity, limit=1000):
                 if hasattr(message, 'reply_to') and message.reply_to:
-                    if hasattr(message.reply_to, 'reply_to_msg_id'):
+                    # Forum topics use reply_to_msg_id for the root topic message
+                    # Check for forum_topic attribute (if present) or reply_to_msg_id
+                    topic_id = None
+                    if hasattr(message.reply_to, 'forum_topic') and message.reply_to.forum_topic:
+                        # This is a forum topic message
                         topic_id = message.reply_to.reply_to_msg_id
-                        if topic_id and topic_id not in topics_dict:
-                            # Try to get the actual topic title from the first message
-                            try:
-                                topic_msg = await self.client.get_messages(entity, ids=topic_id)
-                                if topic_msg and hasattr(topic_msg, 'message'):
-                                    title = topic_msg.message if topic_msg.message else f"Topic {topic_id}"
-                                else:
-                                    title = f"Topic {topic_id}"
-                            except Exception:
+                    elif hasattr(message.reply_to, 'reply_to_msg_id') and message.reply_to.reply_to_msg_id:
+                        # Could be a forum topic or regular reply - check if message is part of a topic thread
+                        topic_id = message.reply_to.reply_to_msg_id
+                    
+                    if topic_id and topic_id not in topics_dict:
+                        # Try to get the actual topic title from the first message
+                        try:
+                            topic_msg = await self.client.get_messages(entity, ids=topic_id)
+                            if topic_msg and hasattr(topic_msg, 'message') and topic_msg.message:
+                                title = topic_msg.message[:50]  # Limit title length
+                            else:
                                 title = f"Topic {topic_id}"
-                            topics_dict[topic_id] = {
-                                'id': topic_id,
-                                'title': title
-                            }
-        except Exception:
-            pass
+                        except Exception as e:
+                            log_debug(f"Failed to fetch topic message {topic_id}: {e}")
+                            title = f"Topic {topic_id}"
+                        
+                        topics_dict[topic_id] = {
+                            'id': topic_id,
+                            'title': title
+                        }
+            
+            log_debug(f"Found {len(topics_dict)} topics via message scanning")
+        except Exception as e:
+            log_debug(f"Error extracting topics from messages: {e}")
+        
         return list(topics_dict.values())
 
     async def get_topic_messages(self, entity, topic_id, limit=None):
@@ -86,8 +98,10 @@ class TopicHandler:
                 reply_to=topic_id
             ):
                 messages.append(message)
+            log_debug(f"Retrieved {len(messages)} messages from topic {topic_id}")
             return messages
-        except Exception:
+        except Exception as e:
+            log_debug(f"Error getting messages for topic {topic_id}: {e}")
             return []
 
     def get_topic_name(self, topic):

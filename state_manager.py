@@ -6,38 +6,67 @@ import json
 import os
 from datetime import datetime
 import hashlib
+import config
+
+
+def log_debug(message):
+    """Print debug message if DEBUG is enabled"""
+    if config.DEBUG:
+        print(f"[DEBUG] {message}")
 
 
 class StateManager:
+    def _migrate_to_dict_format(self):
+        """Migrate downloaded_messages from list format to dict format if needed."""
+        if isinstance(self.state['downloaded_messages'], list):
+            log_debug("Migrating downloaded_messages from list to dict format")
+            old_list = self.state['downloaded_messages']
+            self.state['downloaded_messages'] = {}
+            for old_id in old_list:
+                self.state['downloaded_messages'][str(old_id)] = {
+                    'filename': 'unknown',
+                    'size': 0,
+                    'path': None
+                }
+    
     def generate_state_from_existing_files(self, backup_dir):
         """
         Scan the backup directory and mark all found media files as downloaded in the state file.
         """
-        import mimetypes
         downloaded = {}
         total_files = 0
         total_bytes = 0
-        for root, _, files in os.walk(backup_dir):
-            for fname in files:
-                if fname.startswith('.'):
-                    continue
-                fpath = os.path.join(root, fname)
-                if not os.path.isfile(fpath):
-                    continue
-                size = os.path.getsize(fpath)
-                # Use filename as message_id if no better info
-                msg_id = fname.split('.')[0]
-                downloaded[msg_id] = {
-                    'filename': fname,
-                    'size': size,
-                    'path': fpath
-                }
-                total_files += 1
-                total_bytes += size
-        self.state['downloaded_messages'] = downloaded
-        self.state['total_files'] = total_files
-        self.state['total_bytes'] = total_bytes
-        self._save_state()
+        log_debug(f"Generating state from existing files in {backup_dir}")
+        try:
+            for root, _, files in os.walk(backup_dir):
+                for fname in files:
+                    if fname.startswith('.'):
+                        continue
+                    fpath = os.path.join(root, fname)
+                    if not os.path.isfile(fpath):
+                        continue
+                    try:
+                        size = os.path.getsize(fpath)
+                        # Use filename as message_id if no better info
+                        msg_id = fname.split('.')[0]
+                        downloaded[msg_id] = {
+                            'filename': fname,
+                            'size': size,
+                            'path': fpath
+                        }
+                        total_files += 1
+                        total_bytes += size
+                    except Exception as e:
+                        log_debug(f"Error processing file {fpath}: {e}")
+                        continue
+            
+            self.state['downloaded_messages'] = downloaded
+            self.state['total_files'] = total_files
+            self.state['total_bytes'] = total_bytes
+            self._save_state()
+            log_debug(f"Generated state with {total_files} files ({total_bytes} bytes)")
+        except Exception as e:
+            log_debug(f"Error generating state from existing files: {e}")
 
     def __init__(self, output_dir, chat_name):
         """
@@ -62,10 +91,13 @@ class StateManager:
         if os.path.exists(self.state_file):
             try:
                 with open(self.state_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception:
-                pass
+                    loaded_state = json.load(f)
+                log_debug(f"Loaded existing state from {self.state_file}")
+                return loaded_state
+            except Exception as e:
+                log_debug(f"Failed to load state file: {e}. Creating new state.")
         
+        log_debug(f"Creating new state for chat: {self.chat_name}")
         return {
             'chat_name': self.chat_name,
             'started_at': datetime.now().isoformat(),
@@ -87,7 +119,9 @@ class StateManager:
         try:
             with open(self.state_file, 'w', encoding='utf-8') as f:
                 json.dump(self.state, f, indent=2)
+            log_debug(f"State saved to {self.state_file}")
         except Exception as e:
+            log_debug(f"Error saving state: {e}")
             print(f"⚠️  Warning: Could not save state: {e}")
     
     def validate_downloaded_file(self, message_id):
@@ -97,10 +131,8 @@ class StateManager:
         if not self.is_message_downloaded(message_id):
             return False
         
-        # Handle both old format (list) and new format (dict)
-        if isinstance(self.state['downloaded_messages'], list):
-            # Old format - can't validate without file info
-            return True
+        # Migrate format if needed
+        self._migrate_to_dict_format()
         
         file_info = self.state['downloaded_messages'].get(str(message_id))
         if not file_info:
@@ -111,21 +143,28 @@ class StateManager:
         
         # Check if file exists
         if not file_path or not os.path.exists(file_path):
+            log_debug(f"File not found for message {message_id}: {file_path}")
             return False
         
         # Check if file size is reasonable (not corrupted/incomplete)
-        actual_size = os.path.getsize(file_path)
-        if actual_size == 0:
-            return False
-        
-        # If we have expected size, validate it matches (within 1% tolerance for metadata)
-        if expected_size > 0:
-            size_diff = abs(actual_size - expected_size)
-            tolerance = expected_size * 0.01  # 1% tolerance
-            if size_diff > tolerance and size_diff > 1024:  # Allow 1KB difference for small files
+        try:
+            actual_size = os.path.getsize(file_path)
+            if actual_size == 0:
+                log_debug(f"File is empty for message {message_id}: {file_path}")
                 return False
-        
-        return True
+            
+            # If we have expected size, validate it matches (within 1% tolerance for metadata)
+            if expected_size > 0:
+                size_diff = abs(actual_size - expected_size)
+                tolerance = expected_size * 0.01  # 1% tolerance
+                if size_diff > tolerance and size_diff > 1024:  # Allow 1KB difference for small files
+                    log_debug(f"File size mismatch for message {message_id}: expected {expected_size}, got {actual_size}")
+                    return False
+            
+            return True
+        except Exception as e:
+            log_debug(f"Error validating file for message {message_id}: {e}")
+            return False
     
     def is_message_downloaded(self, message_id):
         """
@@ -164,27 +203,19 @@ class StateManager:
         return False
     
     def mark_downloaded(self, message_id, file_path=None, file_size=0):
-
         """
         Mark a message as successfully downloaded, with file info.
         """
         msg_id_str = str(message_id)
         
         # Migrate old format to new format if needed
-        if isinstance(self.state['downloaded_messages'], list):
-            old_list = self.state['downloaded_messages']
-            self.state['downloaded_messages'] = {}
-            for old_id in old_list:
-                self.state['downloaded_messages'][str(old_id)] = {
-                    'filename': 'unknown',
-                    'size': 0,
-                    'path': None
-                }
+        self._migrate_to_dict_format()
         
         # Add or update entry
         if msg_id_str not in self.state['downloaded_messages']:
             self.state['total_files'] += 1
             self.state['total_bytes'] += file_size
+            log_debug(f"Marked message {message_id} as downloaded: {os.path.basename(file_path) if file_path else 'N/A'}")
         
         self.state['downloaded_messages'][msg_id_str] = {
             'filename': os.path.basename(file_path) if file_path else 'unknown',
@@ -201,6 +232,7 @@ class StateManager:
         """
         if message_id not in self.state['skipped_messages']:
             self.state['skipped_messages'].append(message_id)
+            log_debug(f"Marked message {message_id} as skipped")
         
         self.state['last_message_id'] = message_id
         self._save_state()
@@ -211,6 +243,7 @@ class StateManager:
         """
         if message_id not in self.state['failed_messages']:
             self.state['failed_messages'].append(message_id)
+            log_debug(f"Marked message {message_id} as failed")
         
         self.state['last_message_id'] = message_id
         self._save_state()
@@ -276,5 +309,6 @@ class StateManager:
         if os.path.exists(self.state_file):
             try:
                 os.remove(self.state_file)
-            except Exception:
-                pass
+                log_debug(f"Deleted state file: {self.state_file}")
+            except Exception as e:
+                log_debug(f"Failed to delete state file: {e}")

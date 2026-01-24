@@ -22,9 +22,10 @@ import utils
 console = Console()
 
 class TelegramMediaBackup:
-    def __init__(self, debug=False, simple_mode=False):
+    def __init__(self, debug=False, simple_mode=False, use_last_config=True):
         config.DEBUG = debug
         self.simple_mode = simple_mode
+        self.use_last_config = use_last_config
         self.client_manager = TelegramClientManager()
         self.client = None
         self.last_max_file_size_input = None
@@ -61,7 +62,7 @@ class TelegramMediaBackup:
                 console.print("[bold red]No dialog selected. Exiting.[/bold red]")
                 return
 
-            last_config = self._load_last_config()
+            last_config = self._load_last_config() if self.use_last_config else {}
 
             # Prompt for user preferences (prefilled when possible)
             media_types = self._prompt_media_types(last_config.get('media_types'))
@@ -314,9 +315,25 @@ class TelegramMediaBackup:
         except Exception as e:
             log_debug(f"Could not write last config file: {e}")
 
+def print_help():
+    """Display help message from help.txt file"""
+    try:
+        help_file = os.path.join(os.path.dirname(__file__), 'help.txt')
+        with open(help_file, 'r', encoding='utf-8') as f:
+            help_text = f.read()
+        print(help_text)
+    except FileNotFoundError:
+        console.print("[bold red]Error: help.txt file not found[/bold red]")
+    except Exception as e:
+        console.print(f"[bold red]Error reading help file: {e}[/bold red]")
 
 def main():
     """Entry point"""
+    # Check for help flag
+    if '--help' in sys.argv or '-h' in sys.argv:
+        print_help()
+        return
+    
     # Check for logout flag
     if '--logout' in sys.argv or '--signout' in sys.argv:
         console.print("[bold blue]Logging out...[/bold blue]\n")
@@ -326,6 +343,7 @@ def main():
     
     debug = '--debug' in sys.argv or '--verbose' in sys.argv or '-v' in sys.argv
     simple_mode = '--simple' in sys.argv or '--no-progress' in sys.argv
+    use_last_config = '--fresh' not in sys.argv and '--no-cache' not in sys.argv
     
     if debug:
         console.print("[bold yellow]Starting in DEBUG mode...[/bold yellow]\n")
@@ -333,7 +351,10 @@ def main():
     if simple_mode:
         console.print("[bold cyan]Using simple logging mode (progress bars disabled)...[/bold cyan]\n")
     
-    backup = TelegramMediaBackup(debug=debug, simple_mode=simple_mode)
+    if not use_last_config:
+        console.print("[bold cyan]Fresh mode: ignoring last used settings...[/bold cyan]\n")
+    
+    backup = TelegramMediaBackup(debug=debug, simple_mode=simple_mode, use_last_config=use_last_config)
     asyncio.run(backup.run())
 
 

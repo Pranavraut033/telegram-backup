@@ -34,15 +34,34 @@ python main.py
 ### Command-Line Options
 
 ```bash
+# Show help message
+python main.py --help
+python main.py -h
+
 # Enable debug/verbose logging
 python main.py --debug
 python main.py --verbose
 python main.py -v
 
+# Use simple logging mode (disable progress bars)
+python main.py --simple
+python main.py --no-progress
+
+# Fresh mode - ignore last used settings
+python main.py --fresh
+python main.py --no-cache
+
 # Logout and clear session
 python main.py --logout
 python main.py --signout
 ```
+
+For more detailed help and examples, run:
+```bash
+python main.py --help
+```
+
+or see [help.txt](help.txt)
 
 ### Interactive Flow
 
@@ -63,8 +82,10 @@ python main.py --signout
    - Enter numbers (comma-separated) or type `all`
 
 4. **Set Filters** (optional)
-   - Message limit (leave blank for all messages)
-   - Date range (format: YYYY-MM-DD, leave blank to skip)
+   - **Message limit** - Maximum number of messages to scan (leave blank for all)
+   - **File size limit** - Skip files larger than this (e.g., 50MB, 2GB)
+   - **Date range** - Backup messages from a specific period (format: YYYY-MM-DD, leave blank to skip)
+   - **Sorting** - Sort by date or reaction count
 
 5. **Output Directory**
    - Specify custom path or press Enter for default (`./telegram_media_backup`)
@@ -74,6 +95,7 @@ python main.py --signout
    - Provides real-time updates on downloaded, skipped, and error counts.
    - Displays current file being processed with timestamps.
    - Includes a detailed summary at the end.
+   - Use `--simple` mode to disable progress bars for logging to file
 
 ---
 
@@ -247,6 +269,17 @@ macOS may block downloaded, unsigned binaries with Gatekeeper. If you run into "
 - **State Management**: Tracks download progress in real-time, survives crashes and interruptions
 - **Corrupted File Detection**: Automatically detects and re-downloads missing, empty, or incomplete files
 - **Forum Support**: Automatically detects and handles forum topics
+- **Smart Filtering**: 
+  - Filter by date range (from/to)
+  - Filter by file size (skip files larger than limit)
+  - Limit number of messages to scan
+  - Sort by date or reaction count
+- **Smart Caching**: 
+  - Message lists cached for faster repeated runs
+  - Configurable cache TTL (Time To Live)
+- **Settings Persistence**: 
+  - Remembers last used settings for quick re-runs
+  - `--fresh` flag to ignore cached settings
 - **Smart Authentication**: 
   - Session persistence (no re-authentication needed)
   - Code resend functionality
@@ -256,8 +289,37 @@ macOS may block downloaded, unsigned binaries with Gatekeeper. If you run into "
 - **Duplicate Prevention**: Avoids re-downloading existing files
 - **Organized Storage**: Creates clean folder structure by chat/topic
 - **Error Handling**: Graceful handling of missing permissions, deleted media, etc.
-- **Debug Mode**: Verbose logging for troubleshooting
+- **Debug Mode**: Verbose logging for troubleshooting (`--debug` flag)
+- **Simple Mode**: Disable progress bars for logging to file (`--simple` flag)
 - **Modern CLI UI**: Utilizes `rich` library for a clean, interactive, and colorful terminal experience.
+- **Comprehensive Help**: Built-in help documentation (`--help` flag)
+
+---
+
+## Project Files
+
+### Core Application Files
+
+| File | Purpose |
+|------|---------|
+| `main.py` | Entry point, CLI handler, interactive prompts |
+| `telegram_client.py` | Telegram client wrapper and session management |
+| `downloader.py` | Media download logic with progress tracking |
+| `topic_handler.py` | Forum topic detection and handling |
+| `dialog_selector.py` | Chat/group selection interface |
+| `media_filter.py` | Media type filtering and message validation |
+| `state_manager.py` | Download state management and resume capability |
+| `config.py` | Configuration loader (loads from `.env`) |
+| `utils.py` | Helper utilities (file handling, sanitization) |
+
+### Configuration & Documentation
+
+| File | Purpose |
+|------|---------|
+| `.env.example` | Template for environment variables |
+| `.env` | Your credentials (created from `.env.example`, not committed) |
+| `help.txt` | Help documentation (displayed with `--help`) |
+| `README.md` | This file |
 
 ---
 

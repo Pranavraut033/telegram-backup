@@ -1,0 +1,135 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                    TELEGRAM MEDIA BACKUP - HELP                           ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION:
+  A CLI tool for backing up media (photos, videos, audio, documents) from
+  Telegram chats and groups. Supports filtering by date and media type,
+  with resume capability for interrupted backups.
+
+USAGE:
+  python main.py [OPTIONS]
+
+OPTIONS:
+  -h, --help              Show this help message and exit
+  -v, --debug, --verbose  Enable debug mode with verbose logging output
+  --simple, --no-progress Disable progress bars, use simple logging instead
+  --fresh, --no-cache     Ignore last used settings and prompt for all options
+  --logout, --signout     Sign out and delete the current session
+  
+INTERACTIVE PROMPTS:
+  After starting with 'python main.py', you'll be prompted for:
+  
+  1. Authentication (first time only)
+     - Phone number with country code (e.g., +1234567890)
+     - Login code (received via Telegram or SMS)
+  
+  2. Chat/Group Selection
+     - Browse and select from your chats/groups list
+  
+  3. Media Types
+     - Choose: photos, videos, audio, voice, documents, stickers
+     - Enter numbers comma-separated or type 'all'
+  
+  4. Message Limit (optional)
+     - Maximum number of messages to scan
+     - Leave blank for no limit
+  
+  5. File Size Limit (optional)
+     - Skip files larger than this size (e.g., 50MB)
+     - Leave blank for no limit
+  
+  6. Date Range (optional)
+     - Backup messages from a specific period
+     - Format: YYYY-MM-DD
+     - Leave blank to skip filtering
+  
+  7. Sort Order (optional)
+     - Sort by date (newest/oldest) or reaction count
+  
+  8. Output Directory
+     - Where to save the downloaded files
+     - Default: ./telegram_media_backup
+
+FEATURES:
+  ✓ Resume capability    - Resume interrupted backups
+  ✓ Progress tracking    - Visual progress bars with live stats
+  ✓ Smart caching        - Message lists cached for speed
+  ✓ Forum support        - Backs up from forum topics
+  ✓ State management     - Tracks downloads and validates integrity
+  ✓ Flexible filtering   - By date, file size, media type
+  ✓ Error recovery       - Automatic retry on failures
+  ✓ Multiple media types - Photos, videos, audio, documents, etc.
+
+EXAMPLES:
+
+  # Interactive mode (recommended)
+  python main.py
+
+  # Debug mode for troubleshooting
+  python main.py --debug
+
+  # Simple output without progress bars (good for logging to file)
+  python main.py --simple
+
+  # Fresh mode - ignore last settings and prompt for everything
+  python main.py --fresh
+
+  # Show this help message
+  python main.py --help
+
+  # Logout and start fresh (clears session)
+  python main.py --logout
+
+ENVIRONMENT VARIABLES:
+  These can be set in .env file:
+  
+  API_ID              - Your Telegram API ID (required)
+  API_HASH            - Your Telegram API hash (required)
+  PHONE               - Your phone number with country code
+  SESSION_NAME        - Session file name (default: telegram_backup_session)
+  DEFAULT_OUTPUT_DIR  - Default backup directory
+  DEFAULT_MESSAGE_LIMIT - Default message scan limit
+  LAST_CONFIG_FILE    - File to store last used settings
+
+FILES & FOLDERS:
+  telegram_backup_session.session     - Session file (created after login)
+  .env                               - Configuration file (create from .env.example)
+  .last_backup_config.json           - Remembers last used settings
+  telegram_media_backup/             - Default output directory
+    chat_name/                       - Backup for each chat
+      .backup_state_*.json           - Download progress tracking
+      .message_cache_*.json          - Cached message lists
+      media files...                 - Downloaded media files
+
+TROUBLESHOOTING:
+
+  Q: "ImportError: cannot import name..." 
+  A: Ensure you've installed dependencies: pip install -r requirements.txt
+
+  Q: "API_ID or API_HASH not set"
+  A: Create .env file from .env.example and fill in credentials from https://my.telegram.org/apps
+
+  Q: Code doesn't arrive after entering phone
+  A: Type 'help' when prompted for code to see troubleshooting tips
+
+  Q: Backup interrupted, how to resume?
+  A: Just run the tool again for the same chat - it will automatically resume
+     Or use --fresh flag to start over with fresh settings
+
+  Q: Settings are being remembered but I want to start fresh
+  A: Use --fresh flag to ignore last used settings: python main.py --fresh
+
+  Q: How to backup a different account?
+  A: Run: python main.py --logout (then login with new account)
+
+  Q: Progress bar not showing correctly
+  A: Try --simple mode or run in a proper terminal (not some IDE consoles)
+
+  Q: Out of memory with large backups
+  A: Restart the backup - it will resume from where it left off
+
+MORE INFORMATION:
+  GitHub: https://github.com/Pranavraut033/telegram-backup
+  Issues: https://github.com/Pranavraut033/telegram-backup/issues
+  Wiki:   https://github.com/Pranavraut033/telegram-backup/wiki
