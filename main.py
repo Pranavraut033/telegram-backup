@@ -6,6 +6,7 @@ Handles user interaction, configuration, and main workflow.
 import asyncio
 import os
 import sys
+import json
 from datetime import datetime
 from rich.console import Console
 from rich.panel import Panel
@@ -26,6 +27,7 @@ class TelegramMediaBackup:
         self.simple_mode = simple_mode
         self.client_manager = TelegramClientManager()
         self.client = None
+        self.last_max_file_size_input = None
         
     async def run(self):
         """
@@ -59,16 +61,30 @@ class TelegramMediaBackup:
                 console.print("[bold red]No dialog selected. Exiting.[/bold red]")
                 return
 
-            # Prompt for user preferences
-            media_types = self._prompt_media_types()
+            last_config = self._load_last_config()
+
+            # Prompt for user preferences (prefilled when possible)
+            media_types = self._prompt_media_types(last_config.get('media_types'))
             if not media_types:
                 console.print("[bold red]No media types selected. Exiting.[/bold red]")
                 return
-            message_limit = self._prompt_message_limit()
-            max_file_size = self._prompt_max_file_size()
-            date_range = self._prompt_date_range()
-            sort_by = self._prompt_sorting()
-            output_dir = self._prompt_output_directory()
+            message_limit = self._prompt_message_limit(last_config.get('message_limit'))
+            max_file_size = self._prompt_max_file_size(last_config.get('max_file_size_input'))
+            date_range = self._prompt_date_range(last_config.get('date_from'), last_config.get('date_to'))
+            sort_by = self._prompt_sorting(last_config.get('sort_by'))
+            output_dir = self._prompt_output_directory(last_config.get('output_dir'))
+
+            # Persist last used config for quicker reruns
+            self._save_last_config({
+                'media_types': media_types,
+                'message_limit': message_limit,
+                'max_file_size_input': self.last_max_file_size_input,
+                'max_file_size_bytes': max_file_size,
+                'date_from': date_range[0].isoformat() if date_range[0] else None,
+                'date_to': date_range[1].isoformat() if date_range[1] else None,
+                'output_dir': output_dir,
+                'sort_by': sort_by
+            })
 
             # Set up main components
             media_filter = MediaFilter(media_types)
@@ -140,7 +156,7 @@ class TelegramMediaBackup:
                     sort_by=sort_by
                 )
     
-    def _prompt_media_types(self):
+    def _prompt_media_types(self, last_selected=None):
         """
         Prompt user to select which media types to download.
         Returns a list of selected types.
@@ -153,74 +169,84 @@ class TelegramMediaBackup:
             console.print(f"{idx}. {media_type}")
         
         console.print(f"{len(types) + 1}. All")
+        default_hint = "" if not last_selected else " (Enter to reuse last selection)"
+        choice = Prompt.ask("[bold cyan]Select media types (comma-separated numbers or 'all')[/bold cyan]" + default_hint, default="" if last_selected else "all").strip().lower()
         
-        choice = Prompt.ask("[bold cyan]Select media types (comma-separated numbers or 'all')[/bold cyan]", default="all").strip().lower()
-        
-        if choice == 'all' or choice == str(len(types) + 1):
+        if not choice and last_selected:
+            return last_selected
+        if choice == 'all' or choice == str(len(types) + 1) or (not choice and not last_selected):
             return types
         
         try:
             indices = [int(x.strip()) for x in choice.split(',')]
             selected = [types[i-1] for i in indices if 0 < i <= len(types)]
-            return selected if selected else types
+            return selected if selected else (last_selected or types)
         except (ValueError, IndexError):
-            console.print("[yellow]Invalid input. Selecting all media types.[/yellow]")
-            return types
-    
-    def _prompt_message_limit(self):
+            console.print("[yellow]Invalid input. Selecting previous or all media types.[/yellow]")
+            return last_selected or types
+
+    def _prompt_message_limit(self, last_limit=None):
         """
         Prompt user for a message limit (number of messages to process).
         Returns an integer or None for no limit.
         """
         console.print("\n[bold yellow]=== Message Limit ===[/bold yellow]")
-        choice = Prompt.ask("[bold cyan]Enter message limit (press Enter for all messages)[/bold cyan]", default="").strip()
+        default_val = str(last_limit) if last_limit else ""
+        choice = Prompt.ask("[bold cyan]Enter message limit (press Enter for all messages)[/bold cyan]", default=default_val).strip()
         
         if not choice:
-            return None
+            return last_limit
         
         try:
             limit = int(choice)
-            return limit if limit > 0 else None
+            return limit if limit > 0 else last_limit
         except ValueError:
-            console.print("[yellow]Invalid input. Using no limit.[/yellow]")
-            return None
-    
-    def _prompt_max_file_size(self):
+            console.print("[yellow]Invalid input. Using previous or no limit.[/yellow]")
+            return last_limit
+
+    def _prompt_max_file_size(self, last_input=None):
         """
         Prompt user for max file size to download.
         Returns size in bytes or None for no limit.
         """
         console.print("\n[bold yellow]=== Max File Size ===[/bold yellow]")
         console.print("Skip files larger than specified size (e.g., 100MB, 2GB)")
-        choice = Prompt.ask("[bold cyan]Enter max file size (press Enter for no limit)[/bold cyan]", default="").strip()
+        default_val = last_input or ""
+        choice = Prompt.ask("[bold cyan]Enter max file size (press Enter for no limit)[/bold cyan]", default=default_val).strip()
         
+        if not choice and last_input:
+            choice = last_input
         if not choice:
+            self.last_max_file_size_input = None
             return None
-        
+        raw_choice = choice
         try:
             # Parse size with unit (e.g., "100MB", "2GB", "500KB")
-            choice = choice.upper().replace(" ", "")
+            choice_proc = raw_choice.upper().replace(" ", "")
             
-            if choice.endswith("GB"):
-                size_value = float(choice[:-2])
-                return int(size_value * 1024 * 1024 * 1024)
-            elif choice.endswith("MB"):
-                size_value = float(choice[:-2])
-                return int(size_value * 1024 * 1024)
-            elif choice.endswith("KB"):
-                size_value = float(choice[:-2])
-                return int(size_value * 1024)
-            elif choice.endswith("B"):
-                return int(float(choice[:-1]))
+            if choice_proc.endswith("GB"):
+                size_value = float(choice_proc[:-2])
+                size_bytes = int(size_value * 1024 * 1024 * 1024)
+            elif choice_proc.endswith("MB"):
+                size_value = float(choice_proc[:-2])
+                size_bytes = int(size_value * 1024 * 1024)
+            elif choice_proc.endswith("KB"):
+                size_value = float(choice_proc[:-2])
+                size_bytes = int(size_value * 1024)
+            elif choice_proc.endswith("B"):
+                size_bytes = int(float(choice_proc[:-1]))
             else:
                 # Assume MB if no unit specified
-                size_value = float(choice)
-                return int(size_value * 1024 * 1024)
+                size_value = float(choice_proc)
+                size_bytes = int(size_value * 1024 * 1024)
+            self.last_max_file_size_input = raw_choice
+            return size_bytes
         except (ValueError, IndexError):
-            console.print("[yellow]Invalid input. Using no size limit.[/yellow]")
+            console.print("[yellow]Invalid input. Using previous or no size limit.[/yellow]")
+            self.last_max_file_size_input = last_input
             return None
-    
-    def _prompt_date_range(self):
+
+    def _prompt_date_range(self, default_from=None, default_to=None):
         """
         Prompt user for an optional date range.
         Returns a tuple (start_date, end_date) or (None, None).
@@ -228,8 +254,8 @@ class TelegramMediaBackup:
         console.print("\n[bold yellow]=== Date Range (Optional) ===[/bold yellow]")
         console.print("Format: YYYY-MM-DD")
         
-        date_from = Prompt.ask("[bold cyan]From date (press Enter to skip)[/bold cyan]", default="").strip()
-        date_to = Prompt.ask("[bold cyan]To date (press Enter to skip)[/bold cyan]", default="").strip()
+        date_from = Prompt.ask("[bold cyan]From date (press Enter to skip)[/bold cyan]", default=default_from or "").strip()
+        date_to = Prompt.ask("[bold cyan]To date (press Enter to skip)[/bold cyan]", default=default_to or "").strip()
         
         def parse_date(date_str):
             if not date_str:
@@ -241,13 +267,14 @@ class TelegramMediaBackup:
                 return None
         
         return (parse_date(date_from), parse_date(date_to))
-    
-    def _prompt_output_directory(self):
+
+    def _prompt_output_directory(self, last_output_dir=None):
         """Prompt user for output directory"""
         console.print("\n[bold yellow]=== Output Directory ===[/bold yellow]")
-        choice = Prompt.ask(f"[bold cyan]Enter directory (default: {config.DEFAULT_OUTPUT_DIR})[/bold cyan]", default=config.DEFAULT_OUTPUT_DIR).strip()
+        default_dir = last_output_dir or config.DEFAULT_OUTPUT_DIR
+        choice = Prompt.ask(f"[bold cyan]Enter directory (default: {default_dir})[/bold cyan]", default=default_dir).strip()
         
-        output_dir = choice if choice else config.DEFAULT_OUTPUT_DIR
+        output_dir = choice if choice else default_dir
         
         try:
             utils.create_directory(output_dir)
@@ -257,15 +284,35 @@ class TelegramMediaBackup:
             console.print(f"[yellow]Using default: {config.DEFAULT_OUTPUT_DIR}[/yellow]")
             return config.DEFAULT_OUTPUT_DIR
 
-    def _prompt_sorting(self):
+    def _prompt_sorting(self, last_sort_by=None):
         """Prompt for optional sorting preference"""
         console.print("\n[bold yellow]=== Sorting (Optional) ===[/bold yellow]")
         console.print("1. Default (by date)")
         console.print("2. Most reactions first")
-        choice = Prompt.ask("[bold cyan]Choose sorting (1/2)[/bold cyan]", default="1").strip()
+        default_choice = "2" if last_sort_by == "reactions_desc" else "1"
+        choice = Prompt.ask("[bold cyan]Choose sorting (1/2)[/bold cyan]", default=default_choice).strip()
         if choice == "2":
             return "reactions_desc"
         return None
+
+    def _load_last_config(self):
+        path = config.LAST_CONFIG_FILE
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_last_config(self, data):
+        path = config.LAST_CONFIG_FILE
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            log_debug(f"Could not write last config file: {e}")
 
 
 def main():

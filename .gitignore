@@ -90,3 +90,4 @@ telegram_backup_session.session-journal
 .github/workflows/*.log
 
 telegram_media_backup/
+.last_backup_config.json

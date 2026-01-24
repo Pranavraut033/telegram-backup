@@ -20,6 +20,7 @@ DEFAULT_OUTPUT_DIR = os.getenv("DEFAULT_OUTPUT_DIR", "./telegram_media_backup")
 DEFAULT_MESSAGE_LIMIT = (
     int(os.getenv("DEFAULT_MESSAGE_LIMIT")) if os.getenv("DEFAULT_MESSAGE_LIMIT") else None
 )
+LAST_CONFIG_FILE = os.getenv("LAST_CONFIG_FILE", ".last_backup_config.json")
 
 # Supported media types
 MEDIA_TYPES = {
@@ -32,9 +33,12 @@ MEDIA_TYPES = {
 }
 
 # Download settings
-CHUNK_SIZE = 1024 * 1024  # 1MB chunks
+CHUNK_SIZE = 4 * 1024 * 1024  # 4MB chunks
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds
+
+# Cache settings
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", 600))  # cache valid for 10 minutes by default
 
 # Debug settings
 DEBUG = False  # Set to True for verbose logging

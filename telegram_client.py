@@ -12,7 +12,7 @@ console = Console()
 def log_debug(message):
     """Print debug message if DEBUG is enabled"""
     if config.DEBUG:
-        console.log(f"[DEBUG] {message}")
+        console.print(f"[DEBUG] {message}")
 
 
 class TelegramClientManager:
