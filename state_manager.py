@@ -150,7 +150,7 @@ class StateManager:
         try:
             actual_size = os.path.getsize(file_path)
             if actual_size == 0:
-                log_debug(f"File is empty for message {message_id}: {file_path}")
+                log_debug(f"[VALIDATION FAILED] File is empty (0 bytes) for message {message_id}: {file_path}")
                 return False
             
             # If we have expected size, validate it matches (within 1% tolerance for metadata)
@@ -158,12 +158,13 @@ class StateManager:
                 size_diff = abs(actual_size - expected_size)
                 tolerance = expected_size * 0.01  # 1% tolerance
                 if size_diff > tolerance and size_diff > 1024:  # Allow 1KB difference for small files
-                    log_debug(f"File size mismatch for message {message_id}: expected {expected_size}, got {actual_size}")
+                    log_debug(f"[VALIDATION FAILED] File size mismatch for message {message_id}: expected {expected_size} bytes, got {actual_size} bytes (diff: {size_diff} bytes)")
                     return False
             
+            log_debug(f"[VALIDATION OK] File valid for message {message_id}: {actual_size} bytes at {file_path}")
             return True
         except Exception as e:
-            log_debug(f"Error validating file for message {message_id}: {e}")
+            log_debug(f"[VALIDATION ERROR] Error validating file for message {message_id}: {e}")
             return False
     
     def is_message_downloaded(self, message_id):

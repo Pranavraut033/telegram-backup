@@ -4,6 +4,7 @@ Telegram client initialization and session management
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, FloodWaitError
 import asyncio
+import sys
 import config
 from rich.console import Console
 
@@ -51,6 +52,83 @@ class TelegramClientManager:
     async def _authorize(self):
         """Handle user authorization"""
         console.print("\n[bold yellow]=== Telegram Authentication ===[/bold yellow]")
+        console.print("[bold blue]Choose authentication method:[/bold blue]")
+        console.print("1. Phone number (default)")
+        console.print("2. QR code (scan with your phone)")
+        
+        method = console.input("[bold cyan]Select method (1/2):[/bold cyan] ").strip()
+        
+        if method == '2':
+            await self._authorize_qr()
+        else:
+            await self._authorize_phone()
+        
+        console.print("[green]✓ Authentication successful![/green]\n")
+    
+    async def _authorize_qr(self):
+        """Handle QR code authorization"""
+        try:
+            import qrcode
+        except ImportError:
+            console.print("[bold red]QR code library not installed. Installing...[/bold red]")
+            import subprocess
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'qrcode'])
+            import qrcode
+        
+        console.print("\n[bold blue]🔲 QR Code Authentication[/bold blue]")
+        console.print("[dim]Preparing QR code login...[/dim]\n")
+        
+        try:
+            # Start QR login
+            qr_login = await self.client.qr_login()
+            log_debug("QR login initiated")
+            
+            # Generate and display QR code
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=10,
+                border=4,
+            )
+            qr.add_data(qr_login.url)
+            qr.make(fit=True)
+            
+            console.print("[bold yellow]Scan this QR code with your Telegram app:[/bold yellow]")
+            console.print("[dim]Open Telegram → Settings → Devices → Link Desktop Device[/dim]\n")
+            
+            # Print QR code to terminal
+            qr.print_ascii(invert=True)
+            
+            console.print("\n[dim]Waiting for you to scan the QR code...[/dim]")
+            console.print("[dim](QR code will expire in 30 seconds)[/dim]\n")
+            
+            # Wait for user to scan
+            await qr_login.wait()
+            console.print("[green]✓ QR code scanned successfully![/green]")
+            
+        except asyncio.TimeoutError:
+            console.print("[yellow]⚠️  QR code expired.[/yellow]")
+            console.print("[yellow]Falling back to phone number authentication...[/yellow]\n")
+            await self._authorize_phone()
+            return
+        except Exception as e:
+            error_msg = str(e)
+            log_debug(f"QR login error: {error_msg}")
+            
+            # Check if it's actually successful despite the error
+            if await self.client.is_user_authorized():
+                console.print("[green]✓ Authentication successful![/green]\n")
+                return
+            
+            console.print(f"[red]⚠️  QR code login failed: {error_msg[:100]}[/red]")
+            console.print("[yellow]Falling back to phone number authentication...[/yellow]\n")
+            await self._authorize_phone()
+            return
+        
+        console.print("[green]✓ Authentication successful![/green]\n")
+    
+    async def _authorize_phone(self):
+        """Handle phone number authorization (separated for fallback)"""
         phone = console.input("[bold cyan]Enter your phone number (including + and country code, e.g., +1234567890):[/bold cyan] ").strip()
         
         # Add + if missing
@@ -74,6 +152,7 @@ class TelegramClientManager:
             if 'App' in type_name:
                 console.print("   • Check your Telegram app (any device where you're logged in)")
                 console.print("   • Look in 'Telegram' official chat or notifications")
+                console.print("   • [bold yellow]CHECK TELEGRAM WEB if you're logged in there![/bold yellow]")
             elif 'Sms' in type_name:
                 console.print("   • Check your SMS messages")
             elif 'Call' in type_name:
@@ -82,6 +161,7 @@ class TelegramClientManager:
                 console.print("   • Check for a flash SMS message")
         else:
             console.print("   • Check your Telegram app on any device where you're logged in")
+            console.print("   • [bold yellow]CHECK TELEGRAM WEB - codes often appear there![/bold yellow]")
             console.print("   • The code might also come via SMS or phone call")
         
         console.print("\n[dim]💡 Tip: The code usually appears in Telegram notifications or the official[/dim]")
@@ -92,12 +172,13 @@ class TelegramClientManager:
             
             if code.lower() == 'help':
                 console.print("\n[bold blue]📋 Where to find your Telegram login code:[/bold blue]")
-                console.print("   1. Open Telegram on ANY device (phone, tablet, computer)")
+                console.print("   1. Open Telegram on ANY device (phone, tablet, computer, WEB)")
                 console.print("   2. Look for a message from 'Telegram' (official account)")
                 console.print("   3. Check your notifications/alerts")
-                console.print("   4. The code might also come via SMS to your phone")
-                console.print("   5. Wait at least 30-60 seconds if you just requested it")
-                console.print("\n   [dim]If still no code, type 'resend' to request a new one.[/dim]\n")
+                console.print("   4. [bold yellow]CHECK TELEGRAM WEB - codes often appear there first![/bold yellow]")
+                console.print("   5. The code might also come via SMS to your phone")
+                console.print("   6. Wait at least 30-60 seconds if you just requested it")
+                console.print("\n   [dim]If still no code, type 'resend' (limited attempts) or restart with QR code login.[/dim]\n")
                 continue
             
             if code.lower() == 'resend':
@@ -111,8 +192,11 @@ class TelegramClientManager:
                 except Exception as e:
                     error_msg = str(e)
                     if "SEND_CODE_UNAVAILABLE" in error_msg or "available options" in error_msg.lower():
-                        console.print("[bold yellow]⚠️  Cannot resend code right now. Please use the code you already received,[/bold yellow]")
-                        console.print("[bold yellow]    or wait a few minutes before trying again.[/bold yellow]\n")
+                        console.print("[bold yellow]⚠️  Cannot resend code right now (limit reached).[/bold yellow]")
+                        console.print("[bold yellow]    OPTIONS:[/bold yellow]")
+                        console.print("[bold yellow]    1. Use the code you already received (check Telegram Web!)[/bold yellow]")
+                        console.print("[bold yellow]    2. Wait 10-15 minutes and try again[/bold yellow]")
+                        console.print("[bold yellow]    3. Restart and use QR code login (option 2)[/bold yellow]\n")
                         log_debug(f"Resend error: {error_msg}")
                     else:
                         console.print(f"[bold red]⚠️  Failed to resend code: {error_msg[:80]}[/bold red]\n")

@@ -394,6 +394,10 @@ class MediaDownloader:
         """Download media from a single message"""
         retries = 0
 
+        # Log media type for debugging
+        media_type = type(message.media).__name__ if hasattr(message, 'media') else 'None'
+        log_debug(f"Attempting download for message {message.id}, media type: {media_type}")
+
         # Check file size limit before downloading
         if self.max_file_size is not None:
             file_size = self._get_media_size(message)
@@ -453,12 +457,19 @@ class MediaDownloader:
                         total=0
                     )
 
+                # Log download attempt details
+                expected_size = self._get_media_size(message)
+                log_debug(f"Starting download to: {filepath}, expected size: {utils.format_bytes(expected_size) if expected_size else 'unknown'}")
+
                 # Download media with progress callback
                 result = await self.client.download_media(
                     message.media,
                     file=filepath,
                     progress_callback=progress_callback if not self.simple_mode else None
                 )
+
+                # Log download result
+                log_debug(f"Download result: {result if result else 'None/Failed'}")
 
                 # Remove file task after completion
                 if self.file_progress and self.current_file_task is not None:
@@ -469,11 +480,20 @@ class MediaDownloader:
                     file_size = os.path.getsize(result) if os.path.exists(result) else 0
                     # Validate download (check for incomplete files)
                     if file_size == 0:
-                        log_debug(f"Downloaded file is empty: {filename}")
+                        # Exponential backoff for retries
+                        wait_time = config.RETRY_DELAY * (2 ** retries)
+                        log_debug(f"Downloaded file is empty (0 bytes) for message {message.id}: {filename}. Retry {retries + 1}/{config.MAX_RETRIES} after {wait_time}s")
                         if os.path.exists(result):
                             os.remove(result)
                         retries += 1
-                        await asyncio.sleep(config.RETRY_DELAY)
+                        if retries >= config.MAX_RETRIES:
+                            log_debug(f"Failed to download non-empty file after {config.MAX_RETRIES} attempts: {filename}")
+                            self.stats['errors'] += 1
+                            if self.state_manager:
+                                self.state_manager.mark_failed(message.id)
+                            self._update_progress(errors=1)
+                            return
+                        await asyncio.sleep(wait_time)
                         continue
                     self.stats['downloaded'] += 1
                     self.stats['total_bytes'] += file_size
