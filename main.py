@@ -341,6 +341,28 @@ def main():
         asyncio.run(logout_session(client_manager))
         return
     
+    # Handle consolidate-duplicates mode
+    if '--consolidate-duplicates' in sys.argv or '--find-duplicates' in sys.argv:
+        # Get directory from command line or prompt
+        target_dir = None
+        for i, arg in enumerate(sys.argv):
+            if arg in ['--consolidate-duplicates', '--find-duplicates'] and i + 1 < len(sys.argv):
+                target_dir = sys.argv[i + 1]
+                break
+        
+        if not target_dir:
+            target_dir = Prompt.ask("[cyan]Enter backup directory path to scan for duplicates[/cyan]")
+        
+        if not os.path.isdir(target_dir):
+            console.print(f"[bold red]Error: '{target_dir}' is not a valid directory[/bold red]")
+            sys.exit(1)
+        
+        # Create a downloader instance just for consolidation (no client needed)
+        from downloader import MediaDownloader
+        downloader = MediaDownloader(None, None, target_dir)
+        downloader.consolidate_duplicates(target_dir)
+        return
+    
     debug = '--debug' in sys.argv or '--verbose' in sys.argv or '-v' in sys.argv
     simple_mode = '--simple' in sys.argv or '--no-progress' in sys.argv
     use_last_config = '--fresh' not in sys.argv and '--no-cache' not in sys.argv
