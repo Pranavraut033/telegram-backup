@@ -54,7 +54,36 @@ python main.py --no-cache
 # Logout and clear session
 python main.py --logout
 python main.py --signout
+
+# Find and consolidate duplicate files
+python main.py --consolidate-duplicates /path/to/backup
+python main.py --find-duplicates /path/to/backup
 ```
+
+### Migration Script
+
+If you have existing backups from before the hash-based duplicate detection feature, run the migration script:
+
+```bash
+python migrate_to_hash_detection.py
+```
+
+This will:
+- Compute hashes for all existing files
+- Build the global hash index
+- Identify and consolidate duplicate files
+- Update all state files
+
+See [MIGRATION_SCRIPT.md](MIGRATION_SCRIPT.md) for detailed instructions.
+
+### Documentation
+
+- [SQL_MIGRATION_GUIDE.md](SQL_MIGRATION_GUIDE.md) - **NEW:** Migrate to SQLite for better performance
+- [QUICK_START_SQL.md](QUICK_START_SQL.md) - Quick SQLite migration guide
+- [DUPLICATE_DETECTION.md](DUPLICATE_DETECTION.md) - Comprehensive guide to duplicate detection features
+- [CROSS_CHAT_DUPLICATES.md](CROSS_CHAT_DUPLICATES.md) - How cross-chat duplicate detection works
+- [QUICK_START_DUPLICATES.md](QUICK_START_DUPLICATES.md) - Quick reference guide
+- [MIGRATION_SCRIPT.md](MIGRATION_SCRIPT.md) - Migration script usage and details
 
 For more detailed help and examples, run:
 ```bash
@@ -263,6 +292,7 @@ macOS may block downloaded, unsigned binaries with Gatekeeper. If you run into "
 
 ## Features
 
+- **SQLite Backend** (NEW): 10-50x faster state management with 90% less memory usage
 - **Media Types**: Downloads photos, videos, audio, voice messages, documents, and stickers
 - **Resume Capability**: Automatically resumes interrupted downloads from where they left off
 - **Backup Compatibility**: Skips already downloaded files (backward compatible with previous backups)
@@ -308,7 +338,9 @@ macOS may block downloaded, unsigned binaries with Gatekeeper. If you run into "
 | `topic_handler.py` | Forum topic detection and handling |
 | `dialog_selector.py` | Chat/group selection interface |
 | `media_filter.py` | Media type filtering and message validation |
-| `state_manager.py` | Download state management and resume capability |
+| `state_manager.py` | Download state management and resume capability (dual SQL/JSON) |
+| `state_db.py` | SQLite database layer for efficient state storage |
+| `seed_from_json.py` | Migration script to import JSON state into SQLite |
 | `config.py` | Configuration loader (loads from `.env`) |
 | `utils.py` | Helper utilities (file handling, sanitization) |
 

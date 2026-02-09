@@ -16,6 +16,10 @@ OPTIONS:
   --simple, --no-progress Disable progress bars, use simple logging instead
   --fresh, --no-cache     Ignore last used settings and prompt for all options
   --logout, --signout     Sign out and delete the current session
+  --consolidate-duplicates <DIR>
+  --find-duplicates <DIR> Find and consolidate duplicate files in backup folder
+                          Moves duplicate files to 'duplicates' subfolder while
+                          preserving folder structure. Space-saving utility.
   
 INTERACTIVE PROMPTS:
   After starting with 'python main.py', you'll be prompted for:
