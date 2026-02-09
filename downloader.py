@@ -180,6 +180,13 @@ class MediaDownloader:
             self.state_manager.generate_state_from_existing_files(chat_dir)
             console.print(f"[green]State file generated. Ready to resume backup.[/green]")
         
+        # Ensure hash_index and duplicate_map exist (for backward compatibility - JSON only)
+        if not self.state_manager.use_db:
+            if 'hash_index' not in self.state_manager.state:
+                self.state_manager.state['hash_index'] = {}
+            if 'duplicate_map' not in self.state_manager.state:
+                self.state_manager.state['duplicate_map'] = {}
+        
         if self.state_manager.is_resuming():
             resume_info = self.state_manager.get_resume_info()
             console.print(f"\n[bold blue]🔄 Resuming previous backup...[/bold blue]")
@@ -188,16 +195,34 @@ class MediaDownloader:
             console.print(f"   Already downloaded: [green]{resume_info['downloaded']}[/green] files")
             console.print(f"   [bold blue]📋 Validating existing files...[/bold blue]")
             
-            # Validate and count corrupted files
+            # Validate and count corrupted files (but skip duplicates) - JSON only
             corrupted_count = 0
-            if isinstance(self.state_manager.state['downloaded_messages'], dict):
-                for msg_id in list(self.state_manager.state['downloaded_messages'].keys()):
-                    if not self.state_manager.validate_downloaded_file(msg_id):
-                        corrupted_count += 1
-                        del self.state_manager.state['downloaded_messages'][msg_id]
+            if not self.state_manager.use_db:
+                if isinstance(self.state_manager.state['downloaded_messages'], dict):
+                    for msg_id in list(self.state_manager.state['downloaded_messages'].keys()):
+                        # Skip validation for duplicate messages (they don't have their own file)
+                        if self.state_manager.is_duplicate(msg_id):
+                            continue
+                        
+                        if not self.state_manager.validate_downloaded_file(msg_id):
+                            corrupted_count += 1
+                            del self.state_manager.state['downloaded_messages'][msg_id]
+                
+                if corrupted_count > 0:
+                    console.print(f"   [bold yellow]⚠️  Found {corrupted_count} missing or corrupted files - will re-download[/bold yellow]")
+                
+                # Rebuild hash index if it's empty but we have downloaded files with hashes
+                if not self.state_manager.state.get('hash_index'):
+                    console.print(f"   [bold cyan]🔨 Building hash index for duplicate detection...[/bold cyan]")
+                    self.state_manager.rebuild_hash_index()
             
-            if corrupted_count > 0:
-                console.print(f"   [bold yellow]⚠️  Found {corrupted_count} missing or corrupted files - will re-download[/bold yellow]")
+            # Rebuild global hash index if it's empty (first run or migration) - JSON only
+            if not self.state_manager.use_db and not self.state_manager.global_state.use_db:
+                if not self.state_manager.global_state.state.get('hash_index') or len(self.state_manager.global_state.state['hash_index']) == 0:
+                    console.print(f"   [bold cyan]🌐 Building global hash index for cross-chat duplicate detection...[/bold cyan]")
+                    count = self.state_manager.global_state.rebuild_from_directory(self.output_dir)
+                    if count > 0:
+                        console.print(f"   [green]✓ Global index built with {count} unique files[/green]")
             
             # Load previous stats
             state_stats = self.state_manager.get_stats()
@@ -391,16 +416,24 @@ class MediaDownloader:
         console.print(f"     Processed {message_processed_count} messages ({media_count} with media)")
     
     async def _download_media(self, message, directory):
-        """Download media from a single message"""
+        """Download media from a single message with duplicate detection"""
         retries = 0
 
         # Log media type for debugging
         media_type = type(message.media).__name__ if hasattr(message, 'media') else 'None'
         log_debug(f"Attempting download for message {message.id}, media type: {media_type}")
 
+        # Check if this message is already marked as a duplicate
+        if self.state_manager:
+            canonical_id = self.state_manager.is_duplicate(message.id)
+            if canonical_id:
+                log_debug(f"Message {message.id} is marked as duplicate of {canonical_id}, skipping download")
+                self._update_progress(skipped=1, advance=1)
+                return
+
         # Check file size limit before downloading
+        file_size = self._get_media_size(message)
         if self.max_file_size is not None:
-            file_size = self._get_media_size(message)
             if file_size and file_size > self.max_file_size:
                 if self.state_manager:
                     self.state_manager.mark_skipped(message.id)
@@ -420,24 +453,50 @@ class MediaDownloader:
         file_exists_on_disk = os.path.exists(intended_path)
         file_info = None
         if self.state_manager:
-            file_info = self.state_manager.state.get('downloaded_messages', {}).get(str(message.id))
+            if self.state_manager.use_db:
+                file_info = self.state_manager.db.get_message(self.state_manager.chat_id, message.id)
+            else:
+                file_info = self.state_manager.state.get('downloaded_messages', {}).get(str(message.id))
 
-        # If file exists on disk but not tracked, add it to state
+        # If file exists on disk but not tracked, compute hash and add to state
         if file_exists_on_disk and (not file_info or not self.state_manager.validate_downloaded_file(message.id)):
-            file_size = os.path.getsize(intended_path)
-            self.state_manager.state['downloaded_messages'][str(message.id)] = {
-                'filename': filename,
-                'size': file_size,
-                'path': intended_path
-            }
-            self.state_manager._save_state()
-            log_debug(f"File {filename} found on disk and added to state. Skipping download.")
+            actual_size = os.path.getsize(intended_path)
+            sample_hash = utils.sample_hash_file(intended_path)
+            if self.state_manager.use_db:
+                self.state_manager.mark_downloaded(
+                    message.id,
+                    intended_path,
+                    actual_size,
+                    sample_hash=sample_hash
+                )
+            else:
+                self.state_manager.state['downloaded_messages'][str(message.id)] = {
+                    'filename': filename,
+                    'size': actual_size,
+                    'path': intended_path,
+                    'sample_hash': sample_hash
+                }
+                # Update hash index
+                if sample_hash:
+                    self.state_manager._update_hash_index(actual_size, sample_hash, message.id)
+                self.state_manager._save_state()
+            log_debug(f"File {filename} found on disk and added to state with hash. Skipping download.")
             return
 
         # If file is tracked and valid, skip download
         if file_info and file_info.get('path') and self.state_manager.validate_downloaded_file(message.id):
             log_debug(f"File already downloaded and valid: {filename}, skipping download.")
             return
+
+        # Check for duplicates by size and hash BEFORE downloading
+        if self.state_manager and file_size and file_size > 0:
+            # For large files, check if we already have a file with the same size
+            # to avoid unnecessary downloads
+            existing_msg_id, existing_path = self.state_manager.find_duplicate(file_size, None)
+            
+            # If we found potential duplicates by size, we need to download to compute hash
+            # But for now, let's proceed with download and check hash after
+            pass
 
         # Otherwise, generate a unique filepath (may have _1 if file exists but not valid)
         filepath = utils.get_unique_filepath(directory, filename)
@@ -477,9 +536,9 @@ class MediaDownloader:
                     self.current_file_task = None
 
                 if result:
-                    file_size = os.path.getsize(result) if os.path.exists(result) else 0
+                    actual_size = os.path.getsize(result) if os.path.exists(result) else 0
                     # Validate download (check for incomplete files)
-                    if file_size == 0:
+                    if actual_size == 0:
                         # Exponential backoff for retries
                         wait_time = config.RETRY_DELAY * (2 ** retries)
                         log_debug(f"Downloaded file is empty (0 bytes) for message {message.id}: {filename}. Retry {retries + 1}/{config.MAX_RETRIES} after {wait_time}s")
@@ -495,13 +554,46 @@ class MediaDownloader:
                             return
                         await asyncio.sleep(wait_time)
                         continue
+                    
+                    # Compute sample hash after successful download
+                    sample_hash = utils.sample_hash_file(result) if actual_size > 0 else None
+                    
+                    # Check if this file is a duplicate of an already downloaded file
+                    if self.state_manager and sample_hash and actual_size > 0:
+                        existing_msg_id, existing_path = self.state_manager.find_duplicate(actual_size, sample_hash)
+                        
+                        if existing_msg_id and existing_path and os.path.exists(existing_path):
+                            # Found a duplicate! Remove the just-downloaded file and mark as duplicate
+                            # Determine if it's same chat or cross-chat duplicate
+                            if existing_msg_id == 'global':
+                                # Cross-chat duplicate
+                                chat_name = os.path.basename(os.path.dirname(existing_path))
+                                log_debug(f"Detected cross-chat duplicate: message {message.id} is duplicate of file in chat '{chat_name}'")
+                                os.remove(result)
+                                self.state_manager.mark_duplicate(message.id, f"global:{existing_path}")
+                                self.stats['skipped'] += 1
+                                if self.simple_mode:
+                                    console.print(f"[yellow]⊙ Duplicate:[/yellow] {filename} (exists in '{chat_name}')")
+                                self._update_progress(skipped=1)
+                            else:
+                                # Same chat duplicate
+                                log_debug(f"Detected duplicate: message {message.id} is duplicate of {existing_msg_id}")
+                                os.remove(result)
+                                self.state_manager.mark_duplicate(message.id, existing_msg_id)
+                                self.stats['skipped'] += 1
+                                if self.simple_mode:
+                                    console.print(f"[yellow]⊙ Duplicate:[/yellow] {filename} (same as message {existing_msg_id})")
+                                self._update_progress(skipped=1)
+                            return
+                    
+                    # Not a duplicate, mark as downloaded with hash
                     self.stats['downloaded'] += 1
-                    self.stats['total_bytes'] += file_size
+                    self.stats['total_bytes'] += actual_size
                     if self.state_manager:
-                        self.state_manager.mark_downloaded(message.id, result, file_size)
-                    log_debug(f"Successfully downloaded: {filename} ({utils.format_bytes(file_size)})")
+                        self.state_manager.mark_downloaded(message.id, result, actual_size, sample_hash=sample_hash)
+                    log_debug(f"Successfully downloaded: {filename} ({utils.format_bytes(actual_size)})")
                     if self.simple_mode:
-                        console.print(f"[green]✓ Downloaded:[/green] {filename} ({utils.format_bytes(file_size)})")
+                        console.print(f"[green]✓ Downloaded:[/green] {filename} ({utils.format_bytes(actual_size)})")
                     self._update_progress(downloaded=1)
                 else:
                     self.stats['skipped'] += 1
@@ -602,4 +694,134 @@ class MediaDownloader:
             'errors': 0,
             'total_bytes': 0,
             'skipped_size': 0
+        }
+    
+    def consolidate_duplicates(self, backup_dir):
+        """
+        Find and consolidate duplicate files in a backup directory.
+        Keeps one copy of each unique file and moves duplicates to a 'duplicates' subfolder.
+        
+        Args:
+            backup_dir: Path to the backup directory to scan
+            
+        Returns:
+            dict: Statistics about consolidation (files_scanned, duplicates_found, bytes_saved)
+        """
+        console.print(f"\n[bold cyan]🔍 Scanning for duplicate files in: {backup_dir}[/bold cyan]")
+        
+        # Use find_duplicates logic from find_duplicates.py
+        from collections import defaultdict
+        
+        # Stage 1: Group files by size
+        console.print("[dim]Stage 1/3: Grouping files by size...[/dim]")
+        size_groups = defaultdict(list)
+        total_files = 0
+        
+        for root, _, files in os.walk(backup_dir):
+            # Skip the duplicates folder itself
+            if 'duplicates' in root:
+                continue
+            for fname in files:
+                if fname.startswith('.'):
+                    continue
+                fpath = os.path.join(root, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                try:
+                    size = os.path.getsize(fpath)
+                    size_groups[size].append(fpath)
+                    total_files += 1
+                except Exception:
+                    continue
+        
+        console.print(f"[green]Found {total_files} files[/green]")
+        
+        # Stage 2: For files with same size, compute sample hashes
+        console.print("[dim]Stage 2/3: Computing sample hashes for size collisions...[/dim]")
+        sample_hash_groups = defaultdict(list)
+        
+        for size, paths in size_groups.items():
+            if len(paths) < 2:
+                continue
+            
+            for path in paths:
+                sample_hash = utils.sample_hash_file(path)
+                if sample_hash:
+                    key = f"{size}:{sample_hash}"
+                    sample_hash_groups[key].append(path)
+        
+        # Stage 3: For sample hash collisions, verify with full hash (optional)
+        console.print("[dim]Stage 3/3: Identifying duplicates...[/dim]")
+        duplicate_groups = []
+        
+        for key, paths in sample_hash_groups.items():
+            if len(paths) < 2:
+                continue
+            
+            # For files with same size and sample hash, they are duplicates
+            # (sample hash is highly accurate for our use case)
+            duplicate_groups.append(paths)
+        
+        if not duplicate_groups:
+            console.print("[green]✓ No duplicate files found![/green]")
+            return {
+                'files_scanned': total_files,
+                'duplicates_found': 0,
+                'bytes_saved': 0
+            }
+        
+        console.print(f"\n[bold yellow]Found {len(duplicate_groups)} group(s) of duplicate files[/bold yellow]")
+        
+        # Create duplicates folder
+        duplicates_base = os.path.join(backup_dir, 'duplicates')
+        utils.create_directory(duplicates_base)
+        
+        # Process each duplicate group
+        total_duplicates = 0
+        bytes_saved = 0
+        
+        for idx, group in enumerate(duplicate_groups, start=1):
+            # Keep the first file, move others
+            canonical_path = group[0]
+            duplicates = group[1:]
+            
+            console.print(f"\n[cyan]Group {idx}:[/cyan] {len(group)} copies of [bold]{os.path.basename(canonical_path)}[/bold]")
+            console.print(f"  Keeping: {os.path.relpath(canonical_path, backup_dir)}")
+            
+            for dup_path in duplicates:
+                try:
+                    # Calculate relative path to preserve folder structure
+                    rel_path = os.path.relpath(dup_path, backup_dir)
+                    new_path = os.path.join(duplicates_base, rel_path)
+                    
+                    # Create necessary subdirectories
+                    os.makedirs(os.path.dirname(new_path), exist_ok=True)
+                    
+                    # Move the duplicate file
+                    file_size = os.path.getsize(dup_path)
+                    os.rename(dup_path, new_path)
+                    
+                    total_duplicates += 1
+                    bytes_saved += file_size
+                    
+                    console.print(f"  [yellow]→ Moved:[/yellow] {rel_path}")
+                    
+                    # Update state if state_manager is available
+                    if self.state_manager:
+                        self.state_manager.update_file_path(dup_path, new_path)
+                    
+                except Exception as e:
+                    console.print(f"  [red]✗ Error moving {os.path.basename(dup_path)}: {e}[/red]")
+        
+        # Print summary
+        console.print(f"\n[bold green]✓ Consolidation complete![/bold green]")
+        console.print(f"  Files scanned: {total_files}")
+        console.print(f"  Duplicates moved: {total_duplicates}")
+        console.print(f"  Space saved: {utils.format_bytes(bytes_saved)}")
+        console.print(f"  Duplicates folder: {os.path.relpath(duplicates_base, backup_dir)}")
+        
+        return {
+            'files_scanned': total_files,
+            'duplicates_found': total_duplicates,
+            'bytes_saved': bytes_saved
         }
