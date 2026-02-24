@@ -16,16 +16,31 @@ from dialog_selector import DialogSelector
 from media_filter import MediaFilter
 from topic_handler import TopicHandler
 from downloader import MediaDownloader
+from rclone_manager import RcloneManager
+from transfer_state import TransferState
 import config
 import utils
 
 console = Console()
 
 class TelegramMediaBackup:
-    def __init__(self, debug=False, simple_mode=False, use_last_config=True):
+    def __init__(
+        self,
+        debug=False,
+        simple_mode=False,
+        use_last_config=True,
+        auto_cloud_transfer=False,
+        auto_cloud_mode="copy",
+        auto_threshold_bytes=None,
+        remote_path_override=None,
+    ):
         config.DEBUG = debug
         self.simple_mode = simple_mode
         self.use_last_config = use_last_config
+        self.auto_cloud_transfer = auto_cloud_transfer
+        self.auto_cloud_mode = auto_cloud_mode
+        self.auto_threshold_bytes = auto_threshold_bytes
+        self.remote_path_override = remote_path_override
         self.client_manager = TelegramClientManager()
         self.client = None
         self.last_max_file_size_input = None
@@ -70,6 +85,7 @@ class TelegramMediaBackup:
                 console.print("[bold red]No media types selected. Exiting.[/bold red]")
                 return
             message_limit = self._prompt_message_limit(last_config.get('message_limit'))
+            download_concurrency = self._prompt_download_concurrency(last_config.get('download_concurrency'))
             max_file_size = self._prompt_max_file_size(last_config.get('max_file_size_input'))
             date_range = self._prompt_date_range(last_config.get('date_from'), last_config.get('date_to'))
             sort_by = self._prompt_sorting(last_config.get('sort_by'))
@@ -79,6 +95,7 @@ class TelegramMediaBackup:
             self._save_last_config({
                 'media_types': media_types,
                 'message_limit': message_limit,
+                'download_concurrency': download_concurrency,
                 'max_file_size_input': self.last_max_file_size_input,
                 'max_file_size_bytes': max_file_size,
                 'date_from': date_range[0].isoformat() if date_range[0] else None,
@@ -90,7 +107,14 @@ class TelegramMediaBackup:
             # Set up main components
             media_filter = MediaFilter(media_types)
             topic_handler = TopicHandler(self.client)
-            downloader = MediaDownloader(self.client, media_filter, output_dir, max_file_size=max_file_size, simple_mode=self.simple_mode)
+            downloader = MediaDownloader(
+                self.client,
+                media_filter,
+                output_dir,
+                max_file_size=max_file_size,
+                simple_mode=self.simple_mode,
+                max_concurrent_downloads=download_concurrency
+            )
 
             # Download from forum or regular chat
             is_forum = await topic_handler.is_forum(dialog.entity)
@@ -105,6 +129,9 @@ class TelegramMediaBackup:
                     date_to=date_range[1],
                     sort_by=sort_by
                 )
+
+            if self.auto_cloud_transfer:
+                await self._handle_auto_cloud_transfer(output_dir, downloader.get_stats().get('total_bytes', 0))
             # Summary is printed by downloader now  
         except KeyboardInterrupt:
             console.print("\n\n[bold yellow]⚠️  Operation cancelled by user.[/bold yellow]")
@@ -113,6 +140,45 @@ class TelegramMediaBackup:
             sys.exit(1)
         finally:
             await self.client_manager.disconnect()
+
+    async def _handle_auto_cloud_transfer(self, output_dir, downloaded_bytes_this_run):
+        """Run cloud transfer when cumulative downloaded bytes crosses threshold."""
+        transfer_state = TransferState(output_dir)
+        cumulative_bytes = transfer_state.add_downloaded_bytes(downloaded_bytes_this_run)
+        threshold_bytes = int(self.auto_threshold_bytes or (config.RCLONE_AUTO_THRESHOLD_GB * 1024 * 1024 * 1024))
+
+        console.print(
+            f"\n[bold cyan]☁️  Auto cloud transfer status:[/bold cyan] "
+            f"{utils.format_bytes(cumulative_bytes)} / {utils.format_bytes(threshold_bytes)}"
+        )
+
+        if cumulative_bytes < threshold_bytes:
+            remaining = threshold_bytes - cumulative_bytes
+            console.print(f"[dim]Auto transfer will trigger after {utils.format_bytes(remaining)} more downloads.[/dim]")
+            return
+
+        remote_path = (self.remote_path_override or config.RCLONE_REMOTE_PATH).strip()
+        if not remote_path:
+            console.print("[bold yellow]⚠️  Auto transfer skipped: remote path is not configured.[/bold yellow]")
+            return
+
+        manager = RcloneManager()
+        if not manager.is_available():
+            console.print("[bold yellow]⚠️  Auto transfer skipped: rclone binary not found in PATH.[/bold yellow]")
+            return
+
+        action = self.auto_cloud_mode if self.auto_cloud_mode in {"copy", "move"} else "copy"
+        console.print(f"[bold blue]🚀 Threshold reached. Running rclone {action} to:[/bold blue] {remote_path}")
+
+        try:
+            if action == "move":
+                await asyncio.to_thread(manager.move_to_remote, output_dir, remote_path)
+            else:
+                await asyncio.to_thread(manager.copy_to_remote, output_dir, remote_path)
+            transfer_state.mark_transfer_completed(action)
+            console.print("[bold green]✓ Auto cloud transfer completed. Cumulative counter reset.[/bold green]")
+        except Exception as e:
+            console.print(f"[bold red]❌ Auto cloud transfer failed:[/bold red] {e}")
     
     async def _download_forum_media(self, dialog, topic_handler, downloader, limit, sort_by):
         """
@@ -247,6 +313,26 @@ class TelegramMediaBackup:
             self.last_max_file_size_input = last_input
             return None
 
+    def _prompt_download_concurrency(self, last_value=None):
+        """Prompt user for number of files to download in parallel."""
+        console.print("\n[bold yellow]=== Download Concurrency ===[/bold yellow]")
+        console.print("Number of files to download simultaneously")
+
+        default_value = last_value if last_value else config.DEFAULT_DOWNLOAD_CONCURRENCY
+        choice = Prompt.ask(
+            "[bold cyan]Enter parallel downloads (default: 3)[/bold cyan]",
+            default=str(default_value)
+        ).strip()
+
+        try:
+            value = int(choice)
+            if value < 1:
+                raise ValueError("must be >= 1")
+            return value
+        except (TypeError, ValueError):
+            console.print("[yellow]Invalid input. Using default value 3.[/yellow]")
+            return config.DEFAULT_DOWNLOAD_CONCURRENCY
+
     def _prompt_date_range(self, default_from=None, default_to=None):
         """
         Prompt user for an optional date range.
@@ -341,6 +427,41 @@ def main():
         asyncio.run(logout_session(client_manager))
         return
     
+    # Handle sync-state mode
+    if '--sync-state' in sys.argv:
+        from sync_state import sync_state
+        
+        # Get backup directory from command line or prompt
+        backup_dir = None
+        remote_path = None
+        dry_run = '--dry-run' in sys.argv
+        
+        for i, arg in enumerate(sys.argv):
+            if arg == '--sync-state' and i + 1 < len(sys.argv):
+                backup_dir = sys.argv[i + 1]
+            elif arg == '--remote' and i + 1 < len(sys.argv):
+                remote_path = sys.argv[i + 1]
+        
+        if not backup_dir:
+            backup_dir = Prompt.ask(
+                "[cyan]Enter backup directory path[/cyan]",
+                default=config.DEFAULT_OUTPUT_DIR
+            )
+        
+        if not os.path.isdir(backup_dir):
+            console.print(f"[bold red]Error: '{backup_dir}' is not a valid directory[/bold red]")
+            sys.exit(1)
+        
+        try:
+            sync_state(backup_dir, remote_path, dry_run)
+        except Exception as e:
+            console.print(f"[bold red]❌ State sync failed:[/bold red] {e}")
+            if '--debug' in sys.argv:
+                import traceback
+                traceback.print_exc()
+            sys.exit(1)
+        return
+    
     # Handle consolidate-duplicates mode
     if '--consolidate-duplicates' in sys.argv or '--find-duplicates' in sys.argv:
         # Get directory from command line or prompt
@@ -366,6 +487,124 @@ def main():
     debug = '--debug' in sys.argv or '--verbose' in sys.argv or '-v' in sys.argv
     simple_mode = '--simple' in sys.argv or '--no-progress' in sys.argv
     use_last_config = '--fresh' not in sys.argv and '--no-cache' not in sys.argv
+
+    menu_choice = None
+    auto_cloud_transfer = False
+    auto_cloud_mode = "copy"
+    auto_threshold_bytes = int(config.RCLONE_AUTO_THRESHOLD_GB * 1024 * 1024 * 1024)
+    remote_path_override = None
+
+    if len(sys.argv) == 1:
+        menu_choice = Prompt.ask(
+            "[bold cyan]Select action[/bold cyan]\n"
+            "1. Start backup\n"
+            "2. Start backup with auto cloud transfer\n"
+            "3. Copy local backup to cloud\n"
+            "4. Move local backup to cloud\n"
+            "5. Sync local backup to cloud\n"
+            "6. Generate/sync state from filesystem + remote\n"
+            "7. Exit",
+            default="1"
+        ).strip()
+
+        if menu_choice == "7":
+            return
+        
+        if menu_choice == "6":
+            # Sync state from filesystem and remote
+            from sync_state import sync_state
+            
+            local_dir = Prompt.ask(
+                "[bold cyan]Enter local backup directory[/bold cyan]",
+                default=config.DEFAULT_OUTPUT_DIR
+            ).strip()
+            if not os.path.isdir(local_dir):
+                console.print(f"[bold red]Error: '{local_dir}' is not a valid directory[/bold red]")
+                sys.exit(1)
+            
+            remote_path = Prompt.ask(
+                "[bold cyan]Enter rclone remote path (press Enter to skip)[/bold cyan]",
+                default=config.RCLONE_REMOTE_PATH or ""
+            ).strip()
+            
+            dry_run = Prompt.ask(
+                "[bold cyan]Dry run? (show changes without applying)[/bold cyan]",
+                choices=["yes", "no"],
+                default="no"
+            ).strip().lower() == "yes"
+            
+            try:
+                sync_state(local_dir, remote_path if remote_path else None, dry_run)
+            except Exception as e:
+                console.print(f"[bold red]❌ State sync failed:[/bold red] {e}")
+                sys.exit(1)
+            return
+
+        if menu_choice in {"3", "4", "5"}:
+            local_dir = Prompt.ask(
+                "[bold cyan]Enter local backup directory[/bold cyan]",
+                default=config.DEFAULT_OUTPUT_DIR
+            ).strip()
+            if not os.path.isdir(local_dir):
+                console.print(f"[bold red]Error: '{local_dir}' is not a valid directory[/bold red]")
+                sys.exit(1)
+
+            remote_path = Prompt.ask(
+                "[bold cyan]Enter rclone remote path[/bold cyan]",
+                default=config.RCLONE_REMOTE_PATH
+            ).strip()
+            if not remote_path:
+                console.print("[bold red]Error: rclone remote path is required[/bold red]")
+                sys.exit(1)
+
+            manager = RcloneManager()
+            if not manager.is_available():
+                console.print("[bold red]Error: rclone binary not found in PATH[/bold red]")
+                sys.exit(1)
+
+            action = {"3": "copy", "4": "move", "5": "sync"}[menu_choice]
+            console.print(f"[bold blue]Running rclone {action}...[/bold blue]")
+            try:
+                if action == "copy":
+                    manager.copy_to_remote(local_dir, remote_path)
+                elif action == "move":
+                    manager.move_to_remote(local_dir, remote_path)
+                else:
+                    manager.sync_to_remote(local_dir, remote_path)
+                console.print(f"[bold green]✓ rclone {action} completed successfully.[/bold green]")
+            except Exception as e:
+                console.print(f"[bold red]❌ rclone {action} failed:[/bold red] {e}")
+                sys.exit(1)
+            return
+
+        if menu_choice == "2":
+            auto_cloud_transfer = True
+            auto_cloud_mode = Prompt.ask(
+                "[bold cyan]Auto transfer mode (copy/move)[/bold cyan]",
+                default=config.RCLONE_DEFAULT_OPERATION if config.RCLONE_DEFAULT_OPERATION in {"copy", "move"} else "copy"
+            ).strip().lower()
+            if auto_cloud_mode not in {"copy", "move"}:
+                auto_cloud_mode = "copy"
+
+            threshold_input = Prompt.ask(
+                "[bold cyan]Auto transfer threshold in GB[/bold cyan]",
+                default=str(config.RCLONE_AUTO_THRESHOLD_GB)
+            ).strip()
+            try:
+                threshold_gb = float(threshold_input)
+                if threshold_gb <= 0:
+                    raise ValueError("threshold must be > 0")
+            except (TypeError, ValueError):
+                threshold_gb = config.RCLONE_AUTO_THRESHOLD_GB
+            auto_threshold_bytes = int(threshold_gb * 1024 * 1024 * 1024)
+
+            remote_path_override = Prompt.ask(
+                "[bold cyan]Rclone remote path (press Enter to use env default)[/bold cyan]",
+                default=config.RCLONE_REMOTE_PATH
+            ).strip()
+            if not remote_path_override:
+                console.print("[bold red]Error: rclone remote path is required for auto transfer[/bold red]")
+                sys.exit(1)
     
     if debug:
         console.print("[bold yellow]Starting in DEBUG mode...[/bold yellow]\n")
@@ -376,7 +615,15 @@ def main():
     if not use_last_config:
         console.print("[bold cyan]Fresh mode: ignoring last used settings...[/bold cyan]\n")
     
-    backup = TelegramMediaBackup(debug=debug, simple_mode=simple_mode, use_last_config=use_last_config)
+    backup = TelegramMediaBackup(
+        debug=debug,
+        simple_mode=simple_mode,
+        use_last_config=use_last_config,
+        auto_cloud_transfer=auto_cloud_transfer,
+        auto_cloud_mode=auto_cloud_mode,
+        auto_threshold_bytes=auto_threshold_bytes,
+        remote_path_override=remote_path_override,
+    )
     asyncio.run(backup.run())
 
 

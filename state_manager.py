@@ -100,28 +100,72 @@ class StateManager:
         self.chat_id = None
         
         if self.use_db:
-            try:
-                # Initialize database
-                db_path = config.DB_PATH or os.path.join(output_dir, "telegram_backup.db")
-                self.db = DatabaseManager(db_path)
-                self.chat_id = self.db.get_or_create_chat(chat_name, self.chat_hash)
-                log_debug(f"Using SQLite backend for chat: {chat_name} (chat_id={self.chat_id})")
-            except Exception as e:
-                log_debug(f"Failed to initialize database: {e}")
-                if config.DB_LEGACY_JSON_FALLBACK:
-                    log_debug("Falling back to JSON backend")
-                    self.use_db = False
-                    self.db = None
-                else:
-                    raise
-        
-        # Fallback to JSON
-        if not self.use_db:
+            self._init_sql_backend_with_recovery()
+        else:
             self.state = self._load_state()
             log_debug(f"Using JSON backend for chat: {chat_name}")
         
         # Initialize global state manager for cross-chat duplicate detection
         self.global_state = GlobalStateManager(output_dir)
+
+    def _is_db_corruption_error(self, error):
+        """Return True if error indicates SQLite corruption/malformed database."""
+        msg = str(error).lower()
+        return any(token in msg for token in [
+            "database disk image is malformed",
+            "malformed",
+            "database corruption",
+            "file is not a database"
+        ])
+
+    def _init_sql_backend_with_recovery(self):
+        """Initialize SQLite backend and recover from corruption if needed."""
+        db_path = config.DB_PATH or os.path.join(self.output_dir, "telegram_backup.db")
+        try:
+            self.db = DatabaseManager(db_path)
+            self.chat_id = self.db.get_or_create_chat(self.chat_name, self.chat_hash)
+            if not self.db.check_integrity():
+                raise sqlite3.DatabaseError("SQLite integrity_check failed")
+            log_debug(f"Using SQLite backend for chat: {self.chat_name} (chat_id={self.chat_id})")
+        except Exception as e:
+            if self._is_db_corruption_error(e):
+                self._recover_sqlite_db(e)
+                self.db = DatabaseManager(db_path)
+                self.chat_id = self.db.get_or_create_chat(self.chat_name, self.chat_hash)
+                log_debug(f"Recovered SQLite backend for chat: {self.chat_name} (chat_id={self.chat_id})")
+            else:
+                raise
+
+    def _recover_sqlite_db(self, error=None):
+        """Recover from SQLite corruption by rotating malformed DB and recreating it."""
+        db_path = config.DB_PATH or os.path.join(self.output_dir, "telegram_backup.db")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        if self.db:
+            try:
+                self.db.close()
+            except Exception:
+                pass
+
+        if os.path.exists(db_path):
+            corrupt_copy = f"{db_path}.corrupt.{timestamp}"
+            try:
+                os.replace(db_path, corrupt_copy)
+                log_debug(f"[DB ERROR] Corrupted database moved to: {corrupt_copy}")
+            except Exception as move_error:
+                log_debug(f"[DB ERROR] Could not archive corrupted database: {move_error}")
+                raise
+
+        for suffix in ["-wal", "-shm"]:
+            sidecar = f"{db_path}{suffix}"
+            if os.path.exists(sidecar):
+                try:
+                    os.remove(sidecar)
+                except Exception:
+                    pass
+
+        if error is not None:
+            log_debug(f"[DB ERROR] Recreating SQLite database after corruption: {error}")
     
     def _sanitize_for_filename(self, name):
         """
@@ -173,57 +217,110 @@ class StateManager:
     
     def validate_downloaded_file(self, message_id):
         """
-        Validate if a downloaded file still exists and is valid.
+        Validate if a downloaded file is available (locally or remotely).
+        Returns True if file exists in any location.
         """
         if not self.is_message_downloaded(message_id):
             return False
         
         if self.use_db:
-            file_info = self.db.get_message(self.chat_id, message_id)
+            try:
+                file_info = self.db.get_message(self.chat_id, message_id)
+            except Exception as e:
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    return self.validate_downloaded_file(message_id)
+                raise
             if not file_info:
                 return False
+            
+            # Check if file is available in any location
+            local_path = file_info.get('local_path') or file_info.get('file_path')
+            remote_path = file_info.get('remote_path')
+            storage_status = file_info.get('storage_status', 'local')
+            
+            # If marked as remote-only or both, trust the state (hybrid mode)
+            if storage_status in ('remote', 'both'):
+                if remote_path:
+                    log_debug(f"[VALIDATION OK] File available remotely for message {message_id}: {remote_path}")
+                    return True
+            
+            # Check local file if present
+            if local_path and os.path.exists(local_path):
+                expected_size = file_info.get('file_size', 0)
+                try:
+                    actual_size = os.path.getsize(local_path)
+                    if actual_size == 0:
+                        log_debug(f"[VALIDATION FAILED] Local file is empty (0 bytes) for message {message_id}: {local_path}")
+                        return False
+                    
+                    # Size validation
+                    if expected_size > 0:
+                        size_diff = abs(actual_size - expected_size)
+                        tolerance = expected_size * 0.01
+                        if size_diff > tolerance and size_diff > 1024:
+                            log_debug(f"[VALIDATION FAILED] File size mismatch for message {message_id}: expected {expected_size} bytes, got {actual_size} bytes")
+                            return False
+                    
+                    log_debug(f"[VALIDATION OK] Local file valid for message {message_id}: {actual_size} bytes at {local_path}")
+                    return True
+                except Exception as e:
+                    log_debug(f"[VALIDATION ERROR] Error validating local file for message {message_id}: {e}")
+            
+            # No valid local file, but might be remote-only
+            if storage_status == 'remote' and remote_path:
+                log_debug(f"[VALIDATION OK] File marked as remote-only for message {message_id}")
+                return True
+            
+            log_debug(f"[VALIDATION FAILED] No valid location found for message {message_id}")
+            return False
         else:
-            # Migrate format if needed
+            # JSON backend - legacy local-only validation
             self._migrate_to_dict_format()
             file_info = self.state['downloaded_messages'].get(str(message_id))
             if not file_info:
                 return False
         
-        file_path = file_info.get('file_path') if self.use_db else file_info.get('path')
-        expected_size = file_info.get('file_size') if self.use_db else file_info.get('size', 0)
+            file_path = file_info.get('path')
+            expected_size = file_info.get('size', 0)
         
-        # Check if file exists
-        if not file_path or not os.path.exists(file_path):
-            log_debug(f"File not found for message {message_id}: {file_path}")
-            return False
-        
-        # Check if file size is reasonable (not corrupted/incomplete)
-        try:
-            actual_size = os.path.getsize(file_path)
-            if actual_size == 0:
-                log_debug(f"[VALIDATION FAILED] File is empty (0 bytes) for message {message_id}: {file_path}")
+            if not file_path or not os.path.exists(file_path):
+                log_debug(f"File not found for message {message_id}: {file_path}")
                 return False
-            
-            # If we have expected size, validate it matches (within 1% tolerance for metadata)
-            if expected_size > 0:
-                size_diff = abs(actual_size - expected_size)
-                tolerance = expected_size * 0.01  # 1% tolerance
-                if size_diff > tolerance and size_diff > 1024:  # Allow 1KB difference for small files
-                    log_debug(f"[VALIDATION FAILED] File size mismatch for message {message_id}: expected {expected_size} bytes, got {actual_size} bytes (diff: {size_diff} bytes)")
+        
+            try:
+                actual_size = os.path.getsize(file_path)
+                if actual_size == 0:
+                    log_debug(f"[VALIDATION FAILED] File is empty (0 bytes) for message {message_id}: {file_path}")
                     return False
             
-            log_debug(f"[VALIDATION OK] File valid for message {message_id}: {actual_size} bytes at {file_path}")
-            return True
-        except Exception as e:
-            log_debug(f"[VALIDATION ERROR] Error validating file for message {message_id}: {e}")
-            return False
+                if expected_size > 0:
+                    size_diff = abs(actual_size - expected_size)
+                    tolerance = expected_size * 0.01
+                    if size_diff > tolerance and size_diff > 1024:
+                        log_debug(f"[VALIDATION FAILED] File size mismatch for message {message_id}: expected {expected_size} bytes, got {actual_size} bytes (diff: {size_diff} bytes)")
+                        return False
+            
+                log_debug(f"[VALIDATION OK] File valid for message {message_id}: {actual_size} bytes at {file_path}")
+                return True
+            except Exception as e:
+                log_debug(f"[VALIDATION ERROR] Error validating file for message {message_id}: {e}")
+                return False
     
     def is_message_downloaded(self, message_id):
         """
         Return True if the message is already downloaded and file is valid.
         """
         if self.use_db:
-            return self.db.is_message_downloaded(self.chat_id, message_id)
+            try:
+                return self.db.is_message_downloaded(self.chat_id, message_id)
+            except Exception as e:
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    return self.is_message_downloaded(message_id)
+                raise
         
         msg_id_str = str(message_id)
         # Handle both old format (list) and new format (dict)
@@ -237,8 +334,15 @@ class StateManager:
         Return True if the message was skipped.
         """
         if self.use_db:
-            status = self.db.get_message_status(self.chat_id, message_id)
-            return status == 'skipped'
+            try:
+                status = self.db.get_message_status(self.chat_id, message_id)
+                return status == 'skipped'
+            except Exception as e:
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    return self.is_message_skipped(message_id)
+                raise
         
         return message_id in self.state['skipped_messages']
     
@@ -247,8 +351,15 @@ class StateManager:
         Return True if the message failed before.
         """
         if self.use_db:
-            status = self.db.get_message_status(self.chat_id, message_id)
-            return status == 'failed'
+            try:
+                status = self.db.get_message_status(self.chat_id, message_id)
+                return status == 'failed'
+            except Exception as e:
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    return self.is_message_failed(message_id)
+                raise
         
         return message_id in self.state['failed_messages']
     
@@ -257,7 +368,14 @@ class StateManager:
         Update file path in state when a file is renamed.
         """
         if self.use_db:
-            return self.db.update_file_path(old_path, new_path)
+            try:
+                return self.db.update_file_path(old_path, new_path)
+            except Exception as e:
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    return self.update_file_path(old_path, new_path)
+                raise
         
         if isinstance(self.state['downloaded_messages'], dict):
             for msg_id, file_info in self.state['downloaded_messages'].items():
@@ -310,6 +428,10 @@ class StateManager:
                 log_debug(f"[DB ERROR] Integrity error while marking downloaded for message {message_id}: {e}")
             except Exception as e:
                 log_debug(f"[DB ERROR] Failed to mark downloaded for message {message_id}: {e}")
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    self.mark_downloaded(message_id, file_path, file_size, sample_hash, full_hash)
             return
         
         # JSON backend
@@ -360,6 +482,10 @@ class StateManager:
                 log_debug(f"[DB ERROR] Integrity error while marking skipped for message {message_id}: {e}")
             except Exception as e:
                 log_debug(f"[DB ERROR] Failed to mark skipped for message {message_id}: {e}")
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    self.mark_skipped(message_id)
             return
         
         if message_id not in self.state['skipped_messages']:
@@ -382,6 +508,10 @@ class StateManager:
                 log_debug(f"[DB ERROR] Integrity error while marking failed for message {message_id}: {e}")
             except Exception as e:
                 log_debug(f"[DB ERROR] Failed to mark failed for message {message_id}: {e}")
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    self.mark_failed(message_id)
             return
         
         if message_id not in self.state['failed_messages']:
@@ -396,8 +526,16 @@ class StateManager:
         Mark the backup as completed.
         """
         if self.use_db:
-            self.db.mark_chat_completed(self.chat_id)
-            log_debug(f"Marked chat as completed (SQL)")
+            try:
+                self.db.mark_chat_completed(self.chat_id)
+                log_debug(f"Marked chat as completed (SQL)")
+            except Exception as e:
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    self.mark_completed()
+                else:
+                    raise
             return
         
         self.state['completed'] = True
@@ -409,8 +547,15 @@ class StateManager:
         Get current state statistics as a dict.
         """
         if self.use_db:
-            chat_stats = self.db.get_chat_stats(self.chat_id)
-            status_counts = self.db.get_status_counts(self.chat_id)
+            try:
+                chat_stats = self.db.get_chat_stats(self.chat_id)
+                status_counts = self.db.get_status_counts(self.chat_id)
+            except Exception as e:
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    return self.get_stats()
+                raise
             
             return {
                 'downloaded': status_counts.get('downloaded', 0),
@@ -439,7 +584,14 @@ class StateManager:
         Return True if this is a resume operation (previous state exists).
         """
         if self.use_db:
-            stats = self.db.get_chat_stats(self.chat_id)
+            try:
+                stats = self.db.get_chat_stats(self.chat_id)
+            except Exception as e:
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    return self.is_resuming()
+                raise
             return (stats.get('total_files', 0) > 0 or 
                    stats.get('last_message_id') is not None)
         
@@ -459,8 +611,15 @@ class StateManager:
             return None
         
         if self.use_db:
-            stats = self.db.get_chat_stats(self.chat_id)
-            status_counts = self.db.get_status_counts(self.chat_id)
+            try:
+                stats = self.db.get_chat_stats(self.chat_id)
+                status_counts = self.db.get_status_counts(self.chat_id)
+            except Exception as e:
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    return self.get_resume_info()
+                raise
             return {
                 'started_at': stats.get('started_at'),
                 'last_updated': stats.get('last_updated'),
@@ -514,7 +673,7 @@ class StateManager:
     
     def find_duplicate(self, file_size, sample_hash):
         """
-        Find if a file with the same size and hash already exists.
+        Find if a file with the same size and hash already exists (locally or remotely).
         Checks both local (this chat) and global (all chats) hash indices.
         
         Args:
@@ -522,27 +681,59 @@ class StateManager:
             sample_hash: Sample hash to match
             
         Returns:
-            tuple: (message_id, file_path) of existing file, or (None, None) if no duplicate
+            tuple: (message_id, location_info) where location_info is either:
+                   - file_path (string) for local files
+                   - dict with 'path', 'remote_path', 'storage_status' for location-aware
+                   or (None, None) if no duplicate
         """
         if self.use_db:
-            # Check within same chat first
-            result = self.db.find_duplicate_in_chat(self.chat_id, file_size, sample_hash)
-            if result:
-                msg_id, file_path = result
-                if os.path.exists(file_path):
-                    log_debug(f"Found duplicate in same chat (SQL): size={file_size}, hash={sample_hash[:8]}... -> message {msg_id}")
-                    return msg_id, file_path
-            
-            # Check global index
-            global_path = self.db.find_duplicate_by_hash(file_size, sample_hash)
-            if global_path and os.path.exists(global_path):
-                log_debug(f"Found duplicate across chats (SQL): size={file_size}, hash={sample_hash[:8]}... -> {global_path}")
-                return 'global', global_path
-            
+            try:
+                # Check within same chat first
+                result = self.db.find_duplicate_in_chat(self.chat_id, file_size, sample_hash)
+                if result:
+                    msg_id = result.get('message_id')
+                    local_path = result.get('local_path') or result.get('file_path')
+                    remote_path = result.get('remote_path')
+                    storage_status = result.get('storage_status', 'local')
+                    
+                    # Check if file is available in any location
+                    if storage_status == 'remote' and remote_path:
+                        log_debug(f"Found remote duplicate in same chat (SQL): size={file_size}, hash={sample_hash[:8]}... -> message {msg_id} (remote)")
+                        return msg_id, {'remote_path': remote_path, 'storage_status': 'remote'}
+                    
+                    if local_path and os.path.exists(local_path):
+                        log_debug(f"Found local duplicate in same chat (SQL): size={file_size}, hash={sample_hash[:8]}... -> message {msg_id}")
+                        return msg_id, local_path
+                    
+                    if storage_status == 'both':
+                        log_debug(f"Found duplicate in both locations (SQL): message {msg_id}")
+                        return msg_id, {'local_path': local_path, 'remote_path': remote_path, 'storage_status': 'both'}
+
+                # Check global index
+                global_result = self.db.find_duplicate_by_hash(file_size, sample_hash)
+                if global_result:
+                    global_path = global_result.get('path')
+                    storage_location = global_result.get('storage_location', 'local')
+                    remote_ref = global_result.get('remote_ref')
+                    
+                    # Trust remote location in global index
+                    if storage_location == 'remote' and remote_ref:
+                        log_debug(f"Found remote duplicate across chats (SQL): size={file_size}, hash={sample_hash[:8]}... -> {remote_ref}")
+                        return 'global', {'remote_path': remote_ref, 'storage_status': 'remote'}
+                    
+                    if global_path and os.path.exists(global_path):
+                        log_debug(f"Found local duplicate across chats (SQL): size={file_size}, hash={sample_hash[:8]}... -> {global_path}")
+                        return 'global', global_path
+            except Exception as e:
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    return self.find_duplicate(file_size, sample_hash)
+                raise
+
             return None, None
         
-        # JSON backend
-        # First check local hash index (this chat)
+        # JSON backend - legacy local-only
         if 'hash_index' not in self.state:
             self.state['hash_index'] = {}
         
@@ -553,7 +744,6 @@ class StateManager:
         for msg_id_str in existing_msg_ids:
             file_info = self.state['downloaded_messages'].get(msg_id_str)
             if file_info and file_info.get('path'):
-                # Verify file still exists
                 if os.path.exists(file_info['path']):
                     log_debug(f"Found duplicate in same chat: size={file_size}, hash={sample_hash[:8]}... -> message {msg_id_str}")
                     return msg_id_str, file_info['path']
@@ -566,35 +756,61 @@ class StateManager:
         
         return None, None
     
-    def mark_duplicate(self, duplicate_msg_id, canonical_msg_id):
+    def mark_duplicate(self, duplicate_msg_id, canonical_ref):
         """
-        Mark a message as a duplicate of another message.
+        Mark a message as a duplicate of another message or remote file.
         
         Args:
             duplicate_msg_id: The message ID that is a duplicate
-            canonical_msg_id: The message ID of the original file (or 'global' for cross-chat)
+            canonical_ref: Either:
+                - message ID (int/str) of the original in same chat
+                - 'global' for cross-chat duplicate (local file)
+                - 'global:<remote_path>' for cross-chat duplicate (remote file)
+                - dict with location info
         """
         if self.use_db:
-            # For cross-chat duplicates, canonical_msg_id might be 'global'
             try:
-                if canonical_msg_id == 'global':
-                    # Mark as duplicate but don't track specific canonical message
-                    self.db.mark_duplicate(self.chat_id, duplicate_msg_id, self.chat_id, -1)
+                # Parse canonical_ref to determine type
+                if isinstance(canonical_ref, dict):
+                    # Location-aware canonical (remote or both)
+                    canonical_msg_id = -1  # Special marker for location-based duplicate
+                elif isinstance(canonical_ref, str) and canonical_ref.startswith('global:'):
+                    # Cross-chat remote duplicate
+                    canonical_msg_id = -1
+                elif canonical_ref == 'global':
+                    # Cross-chat local duplicate
+                    canonical_msg_id = -1
                 else:
-                    self.db.mark_duplicate(self.chat_id, duplicate_msg_id, self.chat_id, canonical_msg_id)
-                log_debug(f"Marked message {duplicate_msg_id} as duplicate of {canonical_msg_id} (SQL)")
-            except sqlite3.IntegrityError as e:
-                log_debug(f"[DB ERROR] Integrity error while marking duplicate for message {duplicate_msg_id}: {e}")
+                    # Same-chat duplicate
+                    canonical_msg_id = int(canonical_ref) if not isinstance(canonical_ref, int) else canonical_ref
+                
+                self.db.mark_duplicate(self.chat_id, duplicate_msg_id, self.chat_id, canonical_msg_id)
+                self.db.set_message_status(self.chat_id, duplicate_msg_id, 'skipped', 'duplicate')
+                log_debug(f"Marked message {duplicate_msg_id} as duplicate (canonical: {canonical_ref})")
             except Exception as e:
-                log_debug(f"[DB ERROR] Failed to mark duplicate for message {duplicate_msg_id}: {e}")
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    self.mark_duplicate(duplicate_msg_id, canonical_ref)
+                else:
+                    log_debug(f"Error marking duplicate: {e}")
             return
         
+        # JSON backend
+        # JSON backend
         if 'duplicate_map' not in self.state:
             self.state['duplicate_map'] = {}
         
-        self.state['duplicate_map'][str(duplicate_msg_id)] = str(canonical_msg_id)
-        log_debug(f"Marked message {duplicate_msg_id} as duplicate of {canonical_msg_id}")
+        msg_id_str = str(duplicate_msg_id)
+        canonical_str = str(canonical_ref) if not isinstance(canonical_ref, dict) else 'location_based'
+        self.state['duplicate_map'][msg_id_str] = canonical_str
+        
+        # Mark as skipped
+        if msg_id_str not in self.state['skipped_messages']:
+            self.state['skipped_messages'].append(int(duplicate_msg_id))
+        
         self._save_state()
+        log_debug(f"Marked message {duplicate_msg_id} as duplicate of {canonical_ref}")
     
     def is_duplicate(self, message_id):
         """
@@ -604,10 +820,17 @@ class StateManager:
             str: Canonical message ID if duplicate, None otherwise
         """
         if self.use_db:
-            dup_info = self.db.get_duplicate_info(self.chat_id, message_id)
-            if dup_info:
-                return str(dup_info['canonical_msg_id'])
-            return None
+            try:
+                dup_info = self.db.get_duplicate_info(self.chat_id, message_id)
+                if dup_info:
+                    return str(dup_info['canonical_msg_id'])
+                return None
+            except Exception as e:
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    return self.is_duplicate(message_id)
+                raise
         
         if 'duplicate_map' not in self.state:
             return None
@@ -716,21 +939,68 @@ class GlobalStateManager:
         self.db = None
         
         if self.use_db:
-            try:
-                db_path = config.DB_PATH or os.path.join(output_dir, "telegram_backup.db")
-                self.db = DatabaseManager(db_path)
-                log_debug("Using SQLite backend for global state")
-            except Exception as e:
-                log_debug(f"Failed to initialize database for global state: {e}")
-                if config.DB_LEGACY_JSON_FALLBACK:
-                    self.use_db = False
-                    self.db = None
-                else:
-                    raise
+            self._init_sql_backend_with_recovery()
         
         if not self.use_db:
             self.state = self._load_state()
             log_debug("Using JSON backend for global state")
+
+    def _is_db_corruption_error(self, error):
+        """Return True if error indicates SQLite corruption/malformed database."""
+        msg = str(error).lower()
+        return any(token in msg for token in [
+            "database disk image is malformed",
+            "malformed",
+            "database corruption",
+            "file is not a database"
+        ])
+
+    def _init_sql_backend_with_recovery(self):
+        """Initialize global SQLite backend and recover from corruption if needed."""
+        db_path = config.DB_PATH or os.path.join(self.output_dir, "telegram_backup.db")
+        try:
+            self.db = DatabaseManager(db_path)
+            if not self.db.check_integrity():
+                raise sqlite3.DatabaseError("SQLite integrity_check failed")
+            log_debug("Using SQLite backend for global state")
+        except Exception as e:
+            if self._is_db_corruption_error(e):
+                self._recover_sqlite_db(e)
+                self.db = DatabaseManager(db_path)
+                log_debug("Recovered SQLite backend for global state")
+            else:
+                raise
+
+    def _recover_sqlite_db(self, error=None):
+        """Recover global SQLite DB by rotating malformed file and recreating it."""
+        db_path = config.DB_PATH or os.path.join(self.output_dir, "telegram_backup.db")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        if self.db:
+            try:
+                self.db.close()
+            except Exception:
+                pass
+
+        if os.path.exists(db_path):
+            corrupt_copy = f"{db_path}.corrupt.{timestamp}"
+            try:
+                os.replace(db_path, corrupt_copy)
+                log_debug(f"[DB ERROR] Corrupted database moved to: {corrupt_copy}")
+            except Exception as move_error:
+                log_debug(f"[DB ERROR] Could not archive corrupted database: {move_error}")
+                raise
+
+        for suffix in ["-wal", "-shm"]:
+            sidecar = f"{db_path}{suffix}"
+            if os.path.exists(sidecar):
+                try:
+                    os.remove(sidecar)
+                except Exception:
+                    pass
+
+        if error is not None:
+            log_debug(f"[DB ERROR] Recreating SQLite database after corruption: {error}")
     
     def _load_state(self):
         """Load existing global state or create new one."""
@@ -772,7 +1042,15 @@ class GlobalStateManager:
             file_path: Absolute path to the file
         """
         if self.use_db:
-            self.db.register_file_hash(file_size, sample_hash, file_path)
+            try:
+                self.db.register_file_hash(file_size, sample_hash, file_path)
+            except Exception as e:
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    self.register_file(file_size, sample_hash, file_path)
+                else:
+                    raise
             return
         
         if 'hash_index' not in self.state:
@@ -801,10 +1079,17 @@ class GlobalStateManager:
             str: Path to existing file, or None if no duplicate
         """
         if self.use_db:
-            file_path = self.db.find_duplicate_by_hash(file_size, sample_hash)
-            if file_path and os.path.exists(file_path):
-                return file_path
-            return None
+            try:
+                file_path = self.db.find_duplicate_by_hash(file_size, sample_hash)
+                if file_path and os.path.exists(file_path):
+                    return file_path
+                return None
+            except Exception as e:
+                if self._is_db_corruption_error(e):
+                    self._recover_sqlite_db(e)
+                    self._init_sql_backend_with_recovery()
+                    return self.find_duplicate(file_size, sample_hash)
+                raise
         
         if 'hash_index' not in self.state:
             return None

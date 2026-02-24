@@ -18,7 +18,7 @@ class DatabaseManager:
     """
     
     # Schema version for migrations
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2  # v2: Add remote/local location tracking
     
     def __init__(self, db_path: str):
         """
@@ -45,6 +45,16 @@ class DatabaseManager:
             # Enable Write-Ahead Logging for better concurrency
             self._local.connection.execute("PRAGMA journal_mode = WAL")
         return self._local.connection
+
+    def close(self):
+        """Close thread-local connection if open."""
+        if hasattr(self._local, 'connection') and self._local.connection is not None:
+            try:
+                self._local.connection.close()
+            except Exception:
+                pass
+            finally:
+                self._local.connection = None
     
     @contextmanager
     def get_cursor(self, commit: bool = False):
@@ -87,11 +97,85 @@ class DatabaseManager:
             current_version = result[0] if result[0] is not None else 0
             
             if current_version < self.SCHEMA_VERSION:
-                self._create_schema(cursor)
-                cursor.execute(
-                    "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                    (self.SCHEMA_VERSION, "Initial schema with full duplicate detection support")
-                )
+                if current_version == 0:
+                    self._create_schema(cursor)
+                    cursor.execute(
+                        "INSERT INTO schema_version (version, description) VALUES (?, ?)",
+                        (self.SCHEMA_VERSION, "Schema v2 with remote/local location tracking")
+                    )
+                else:
+                    # Apply migrations
+                    self._apply_migrations(cursor, current_version)
+
+    def check_integrity(self) -> bool:
+        """
+        Run SQLite integrity check.
+
+        Returns:
+            bool: True if integrity check passes, False otherwise
+        """
+        with self.get_cursor() as cursor:
+            cursor.execute("PRAGMA integrity_check")
+            rows = cursor.fetchall()
+            if not rows:
+                return False
+            return all(str(row[0]).lower() == "ok" for row in rows)
+    
+    def _apply_migrations(self, cursor: sqlite3.Cursor, from_version: int):
+        """Apply incremental schema migrations."""
+        if from_version < 2:
+            self._migrate_to_v2(cursor)
+            cursor.execute(
+                "INSERT INTO schema_version (version, description) VALUES (?, ?)",
+                (2, "Add remote/local location tracking")
+            )
+    
+    def _migrate_to_v2(self, cursor: sqlite3.Cursor):
+        """Migrate schema from v1 to v2: add location tracking fields."""
+        # Add location columns to messages table
+        cursor.execute("""
+            ALTER TABLE messages ADD COLUMN local_path TEXT
+        """)
+        cursor.execute("""
+            ALTER TABLE messages ADD COLUMN remote_path TEXT
+        """)
+        cursor.execute("""
+            ALTER TABLE messages ADD COLUMN remote_ref TEXT
+        """)
+        cursor.execute("""
+            ALTER TABLE messages ADD COLUMN storage_status TEXT DEFAULT 'local'
+        """)
+        cursor.execute("""
+            ALTER TABLE messages ADD COLUMN local_verified_at TIMESTAMP
+        """)
+        cursor.execute("""
+            ALTER TABLE messages ADD COLUMN remote_verified_at TIMESTAMP
+        """)
+        
+        # Migrate existing file_path to local_path
+        cursor.execute("""
+            UPDATE messages SET local_path = file_path WHERE file_path IS NOT NULL
+        """)
+        cursor.execute("""
+            UPDATE messages SET local_verified_at = downloaded_at WHERE file_path IS NOT NULL
+        """)
+        
+        # Add location columns to file_hashes table
+        cursor.execute("""
+            ALTER TABLE file_hashes ADD COLUMN storage_location TEXT DEFAULT 'local'
+        """)
+        cursor.execute("""
+            ALTER TABLE file_hashes ADD COLUMN remote_ref TEXT
+        """)
+        
+        # Create index for remote path lookups
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_remote_path ON messages(remote_path)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_storage_status ON messages(storage_status)
+        """)
+
     
     def _create_schema(self, cursor: sqlite3.Cursor):
         """Create all tables and indexes."""
@@ -124,6 +208,12 @@ class DatabaseManager:
                 sample_hash TEXT,
                 full_hash TEXT,
                 downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                local_path TEXT,
+                remote_path TEXT,
+                remote_ref TEXT,
+                storage_status TEXT DEFAULT 'local',
+                local_verified_at TIMESTAMP,
+                remote_verified_at TIMESTAMP,
                 FOREIGN KEY (chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE,
                 UNIQUE(chat_id, message_id)
             )
@@ -133,6 +223,8 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_file_path ON messages(file_path)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_file_size ON messages(file_size)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_remote_path ON messages(remote_path)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_storage_status ON messages(storage_status)")
         
         # File hashes table (global index)
         cursor.execute("""
@@ -143,6 +235,8 @@ class DatabaseManager:
                 first_occurrence_path TEXT,
                 first_message_id INTEGER,
                 first_chat_id INTEGER,
+                storage_location TEXT DEFAULT 'local',
+                remote_ref TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (first_message_id) REFERENCES messages(id) ON DELETE SET NULL,
                 FOREIGN KEY (first_chat_id) REFERENCES chats(chat_id) ON DELETE SET NULL
@@ -280,27 +374,49 @@ class DatabaseManager:
     
     def add_message(self, chat_id: int, message_id: int, filename: str = None,
                    file_path: str = None, file_size: int = 0,
-                   sample_hash: str = None, full_hash: str = None) -> int:
+                   sample_hash: str = None, full_hash: str = None,
+                   local_path: str = None, remote_path: str = None,
+                   remote_ref: str = None, storage_status: str = 'local') -> int:
         """
-        Add or update a downloaded message.
+        Add or update a downloaded message with location tracking.
+        
+        Args:
+            storage_status: 'local', 'remote', or 'both'
         
         Returns:
             int: message record id
         """
+        # Handle backward compatibility: file_path -> local_path
+        if file_path and not local_path:
+            local_path = file_path
+        
+        now = datetime.now().isoformat()
+        local_verified = now if local_path else None
+        remote_verified = now if remote_path else None
+        
         with self.get_cursor(commit=True) as cursor:
             cursor.execute("""
                 INSERT INTO messages 
-                (chat_id, message_id, filename, file_path, file_size, sample_hash, full_hash, downloaded_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (chat_id, message_id, filename, file_path, file_size, sample_hash, full_hash, 
+                 downloaded_at, local_path, remote_path, remote_ref, storage_status,
+                 local_verified_at, remote_verified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id, message_id) DO UPDATE SET
                     filename = excluded.filename,
                     file_path = excluded.file_path,
                     file_size = excluded.file_size,
                     sample_hash = excluded.sample_hash,
                     full_hash = excluded.full_hash,
-                    downloaded_at = excluded.downloaded_at
-            """, (chat_id, message_id, filename, file_path, file_size, sample_hash, 
-                  full_hash, datetime.now().isoformat()))
+                    downloaded_at = excluded.downloaded_at,
+                    local_path = excluded.local_path,
+                    remote_path = excluded.remote_path,
+                    remote_ref = excluded.remote_ref,
+                    storage_status = excluded.storage_status,
+                    local_verified_at = excluded.local_verified_at,
+                    remote_verified_at = excluded.remote_verified_at
+            """, (chat_id, message_id, filename, file_path or local_path, file_size, 
+                  sample_hash, full_hash, now, local_path, remote_path, remote_ref,
+                  storage_status, local_verified, remote_verified))
 
             cursor.execute(
                 "SELECT id FROM messages WHERE chat_id = ? AND message_id = ?",
@@ -321,14 +437,25 @@ class DatabaseManager:
             return dict(row) if row else None
     
     def is_message_downloaded(self, chat_id: int, message_id: int) -> bool:
-        """Check if message is downloaded."""
+        """Check if message has an available file location (local or remote)."""
         with self.get_cursor() as cursor:
             cursor.execute("""
-                SELECT 1 FROM messages 
+                SELECT local_path, file_path, remote_path, storage_status FROM messages
                 WHERE chat_id = ? AND message_id = ?
             """, (chat_id, message_id))
-            
-            return cursor.fetchone() is not None
+
+            row = cursor.fetchone()
+            if not row:
+                return False
+
+            local_path = row['local_path'] or row['file_path']
+            remote_path = row['remote_path']
+            storage_status = row['storage_status'] or 'local'
+
+            if storage_status in ('remote', 'both') and remote_path:
+                return True
+
+            return bool(local_path)
     
     def get_all_messages(self, chat_id: int) -> List[Dict]:
         """Get all messages for a chat."""
@@ -345,20 +472,122 @@ class DatabaseManager:
         with self.get_cursor(commit=True) as cursor:
             cursor.execute("""
                 UPDATE messages 
-                SET file_path = ?, filename = ?
+                SET file_path = ?, filename = ?, local_path = ?
                 WHERE file_path = ?
-            """, (new_path, os.path.basename(new_path), old_path))
+            """, (new_path, os.path.basename(new_path), new_path, old_path))
             
             return cursor.rowcount > 0
+    
+    def update_message_location(self, chat_id: int, message_id: int,
+                               local_path: str = None, remote_path: str = None,
+                               remote_ref: str = None, storage_status: str = None):
+        """Update location information for a message."""
+        updates = []
+        params = []
+        now = datetime.now().isoformat()
+        
+        if local_path is not None:
+            updates.append("local_path = ?")
+            params.append(local_path)
+            updates.append("local_verified_at = ?")
+            params.append(now)
+            if not storage_status:
+                updates.append("storage_status = ?")
+                params.append('local')
+        
+        if remote_path is not None:
+            updates.append("remote_path = ?")
+            params.append(remote_path)
+            updates.append("remote_verified_at = ?")
+            params.append(now)
+            if not storage_status:
+                updates.append("storage_status = ?")
+                params.append('remote')
+        
+        if remote_ref is not None:
+            updates.append("remote_ref = ?")
+            params.append(remote_ref)
+        
+        if storage_status is not None:
+            updates.append("storage_status = ?")
+            params.append(storage_status)
+        
+        if not updates:
+            return False
+        
+        params.extend([chat_id, message_id])
+        
+        with self.get_cursor(commit=True) as cursor:
+            query = f"UPDATE messages SET {', '.join(updates)} WHERE chat_id = ? AND message_id = ?"
+            cursor.execute(query, params)
+            return cursor.rowcount > 0
+
+    def mark_message_missing(self, chat_id: int, message_id: int, reason: str = None) -> bool:
+        """
+        Mark a message as missing/unavailable by clearing all known file locations.
+
+        This represents "downloaded=false" without deleting the message row.
+        """
+        with self.get_cursor(commit=True) as cursor:
+            cursor.execute("""
+                UPDATE messages
+                SET file_path = NULL,
+                    local_path = NULL,
+                    remote_path = NULL,
+                    remote_ref = NULL,
+                    storage_status = NULL,
+                    local_verified_at = NULL,
+                    remote_verified_at = NULL
+                WHERE chat_id = ? AND message_id = ?
+            """, (chat_id, message_id))
+
+            updated = cursor.rowcount > 0
+            if updated:
+                cursor.execute("""
+                    INSERT INTO message_status
+                    (chat_id, message_id, status, status_reason, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                        status = excluded.status,
+                        status_reason = excluded.status_reason,
+                        updated_at = excluded.updated_at
+                """, (
+                    chat_id,
+                    message_id,
+                    'missing',
+                    reason or 'File not found in local or remote during state sync',
+                    datetime.now().isoformat()
+                ))
+
+            return updated
+    
+    def is_file_available(self, chat_id: int, message_id: int) -> bool:
+        """Check if file is available locally or remotely."""
+        with self.get_cursor() as cursor:
+            cursor.execute("""
+                SELECT local_path, remote_path FROM messages
+                WHERE chat_id = ? AND message_id = ?
+            """, (chat_id, message_id))
+            
+            row = cursor.fetchone()
+            if not row:
+                return False
+            
+            # Available if either location is set
+            return bool(row['local_path'] or row['remote_path'])
     
     # ==================== Hash Index Operations ====================
     
     def register_file_hash(self, file_size: int, sample_hash: str, 
-                          file_path: str, message_id: int = None, 
-                          chat_id: int = None):
+                          file_path: str = None, message_id: int = None, 
+                          chat_id: int = None, storage_location: str = 'local',
+                          remote_ref: str = None):
         """
         Register file in global hash index.
         Only stores first occurrence.
+        
+        Args:
+            storage_location: 'local', 'remote', or 'both'
         """
         hash_key = f"{file_size}:{sample_hash}"
         
@@ -370,46 +599,57 @@ class DatabaseManager:
             
             cursor.execute("""
                 INSERT INTO file_hashes 
-                (hash_key, file_size, sample_hash, first_occurrence_path, first_message_id, first_chat_id)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (hash_key, file_size, sample_hash, file_path, message_id, chat_id))
+                (hash_key, file_size, sample_hash, first_occurrence_path, first_message_id, 
+                 first_chat_id, storage_location, remote_ref)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (hash_key, file_size, sample_hash, file_path, message_id, chat_id,
+                  storage_location, remote_ref))
     
-    def find_duplicate_by_hash(self, file_size: int, sample_hash: str) -> Optional[str]:
+    def find_duplicate_by_hash(self, file_size: int, sample_hash: str) -> Optional[Dict]:
         """
         Find duplicate file by size and hash.
         
         Returns:
-            str: Path to first occurrence, or None
+            Dict with 'path', 'storage_location', 'remote_ref', or None
         """
         hash_key = f"{file_size}:{sample_hash}"
         
         with self.get_cursor() as cursor:
             cursor.execute("""
-                SELECT first_occurrence_path FROM file_hashes 
+                SELECT first_occurrence_path, storage_location, remote_ref 
+                FROM file_hashes 
                 WHERE hash_key = ?
             """, (hash_key,))
             
             row = cursor.fetchone()
-            return row['first_occurrence_path'] if row else None
+            if not row:
+                return None
+            
+            return {
+                'path': row['first_occurrence_path'],
+                'storage_location': row['storage_location'],
+                'remote_ref': row['remote_ref']
+            }
     
     def find_duplicate_in_chat(self, chat_id: int, file_size: int, 
-                               sample_hash: str) -> Optional[Tuple[int, str]]:
+                               sample_hash: str) -> Optional[Dict]:
         """
         Find duplicate within same chat.
         
         Returns:
-            Tuple[int, str]: (message_id, file_path) or None
+            Dict with 'message_id', 'file_path', 'local_path', 'remote_path', or None
         """
         with self.get_cursor() as cursor:
             cursor.execute("""
-                SELECT message_id, file_path FROM messages
+                SELECT message_id, file_path, local_path, remote_path, storage_status
+                FROM messages
                 WHERE chat_id = ? AND file_size = ? AND sample_hash = ?
                 ORDER BY message_id
                 LIMIT 1
             """, (chat_id, file_size, sample_hash))
             
             row = cursor.fetchone()
-            return (row['message_id'], row['file_path']) if row else None
+            return dict(row) if row else None
     
     # ==================== Duplicate Tracking ====================
     
@@ -702,6 +942,145 @@ class DatabaseManager:
                 'database_size': self.get_database_size()
             }
     
+    # ==================== Bulk Sync Operations ====================
+    
+    def get_all_chats(self) -> List[Dict]:
+        """Get all chats in the database."""
+        with self.get_cursor() as cursor:
+            cursor.execute("SELECT * FROM chats ORDER BY chat_name")
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def bulk_update_from_filesystem(self, chat_id: int, file_records: List[Dict]) -> int:
+        """
+        Bulk update/insert messages from filesystem scan.
+        
+        Args:
+            chat_id: Chat ID to update
+            file_records: List of dicts with keys: message_id, filename, file_path, 
+                         file_size, sample_hash, local_path
+        
+        Returns:
+            Number of records updated/inserted
+        """
+        count = 0
+        with self.get_cursor(commit=True) as cursor:
+            for record in file_records:
+                cursor.execute("""
+                    INSERT INTO messages 
+                    (chat_id, message_id, filename, file_path, file_size, sample_hash,
+                     downloaded_at, local_path, storage_status, local_verified_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'local', ?)
+                    ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                        filename = excluded.filename,
+                        file_path = excluded.file_path,
+                        file_size = excluded.file_size,
+                        sample_hash = excluded.sample_hash,
+                        local_path = excluded.local_path,
+                        storage_status = CASE 
+                            WHEN remote_path IS NOT NULL THEN 'both'
+                            ELSE 'local'
+                        END,
+                        local_verified_at = excluded.local_verified_at
+                """, (
+                    chat_id, 
+                    record['message_id'], 
+                    record.get('filename'),
+                    record.get('file_path') or record.get('local_path'),
+                    record.get('file_size', 0),
+                    record.get('sample_hash'),
+                    datetime.now().isoformat(),
+                    record.get('local_path'),
+                    datetime.now().isoformat()
+                ))
+                count += cursor.rowcount
+        
+        return count
+    
+    def bulk_update_from_remote(self, chat_id: int, file_records: List[Dict]) -> int:
+        """
+        Bulk update messages with remote location info.
+        
+        Args:
+            chat_id: Chat ID to update
+            file_records: List of dicts with keys: message_id, remote_path, remote_ref,
+                         file_size, sample_hash (optional)
+        
+        Returns:
+            Number of records updated
+        """
+        count = 0
+        with self.get_cursor(commit=True) as cursor:
+            for record in file_records:
+                cursor.execute("""
+                    INSERT INTO messages 
+                    (chat_id, message_id, filename, file_size, sample_hash,
+                     downloaded_at, remote_path, remote_ref, storage_status, remote_verified_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'remote', ?)
+                    ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                        remote_path = excluded.remote_path,
+                        remote_ref = excluded.remote_ref,
+                        file_size = COALESCE(excluded.file_size, file_size),
+                        sample_hash = COALESCE(excluded.sample_hash, sample_hash),
+                        storage_status = CASE 
+                            WHEN local_path IS NOT NULL THEN 'both'
+                            ELSE 'remote'
+                        END,
+                        remote_verified_at = excluded.remote_verified_at
+                """, (
+                    chat_id,
+                    record['message_id'],
+                    record.get('filename') or os.path.basename(record.get('remote_path', '')),
+                    record.get('file_size', 0),
+                    record.get('sample_hash'),
+                    datetime.now().isoformat(),
+                    record.get('remote_path'),
+                    record.get('remote_ref'),
+                    datetime.now().isoformat()
+                ))
+                count += cursor.rowcount
+        
+        return count
+    
+    def bulk_register_hashes(self, hash_records: List[Dict]) -> int:
+        """
+        Bulk register file hashes in global index.
+        
+        Args:
+            hash_records: List of dicts with keys: file_size, sample_hash, file_path,
+                         message_id, chat_id, storage_location, remote_ref
+        
+        Returns:
+            Number of hash entries created
+        """
+        count = 0
+        with self.get_cursor(commit=True) as cursor:
+            for record in hash_records:
+                hash_key = f"{record['file_size']}:{record['sample_hash']}"
+                
+                # Check if exists
+                cursor.execute("SELECT 1 FROM file_hashes WHERE hash_key = ?", (hash_key,))
+                if cursor.fetchone():
+                    continue
+                
+                cursor.execute("""
+                    INSERT INTO file_hashes 
+                    (hash_key, file_size, sample_hash, first_occurrence_path, 
+                     first_message_id, first_chat_id, storage_location, remote_ref)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    hash_key,
+                    record['file_size'],
+                    record['sample_hash'],
+                    record.get('file_path'),
+                    record.get('message_id'),
+                    record.get('chat_id'),
+                    record.get('storage_location', 'local'),
+                    record.get('remote_ref')
+                ))
+                count += 1
+        
+        return count
+    
     def cleanup_orphaned_records(self) -> Dict[str, int]:
         """
         Clean up orphaned records and validate foreign key integrity.
@@ -763,9 +1142,17 @@ class DatabaseManager:
             
             # Rebuild from messages
             cursor.execute("""
-                SELECT DISTINCT file_size, sample_hash, file_path, id, chat_id
+                SELECT DISTINCT file_size, sample_hash,
+                       COALESCE(local_path, file_path) as effective_path,
+                       id, chat_id, storage_status, remote_ref
                 FROM messages
-                WHERE sample_hash IS NOT NULL AND file_size > 0
+                WHERE sample_hash IS NOT NULL
+                  AND file_size > 0
+                  AND (
+                      local_path IS NOT NULL
+                      OR file_path IS NOT NULL
+                      OR remote_path IS NOT NULL
+                  )
                 ORDER BY downloaded_at ASC
             """)
             
@@ -777,10 +1164,19 @@ class DatabaseManager:
                 if hash_key not in seen_hashes:
                     cursor.execute("""
                         INSERT INTO file_hashes 
-                        (hash_key, file_size, sample_hash, first_occurrence_path, first_message_id, first_chat_id)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (hash_key, row['file_size'], row['sample_hash'], 
-                          row['file_path'], row['id'], row['chat_id']))
+                        (hash_key, file_size, sample_hash, first_occurrence_path, first_message_id,
+                         first_chat_id, storage_location, remote_ref)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        hash_key,
+                        row['file_size'],
+                        row['sample_hash'],
+                        row['effective_path'],
+                        row['id'],
+                        row['chat_id'],
+                        row['storage_status'] or 'local',
+                        row['remote_ref']
+                    ))
                     
                     seen_hashes.add(hash_key)
                     count += 1

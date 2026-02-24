@@ -36,6 +36,10 @@ MEDIA_TYPES = {
 CHUNK_SIZE = 4 * 1024 * 1024  # 4MB chunks
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds
+try:
+    DEFAULT_DOWNLOAD_CONCURRENCY = max(1, int(os.getenv("DEFAULT_DOWNLOAD_CONCURRENCY", "3")))
+except (TypeError, ValueError):
+    DEFAULT_DOWNLOAD_CONCURRENCY = 3
 
 # Cache settings
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", 600))  # cache valid for 10 minutes by default
@@ -43,10 +47,23 @@ CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", 600))  # cache valid for 
 # Database settings
 DB_ENABLE = os.getenv("DB_ENABLE", "true").lower() == "true"  # Enable SQLite backend
 DB_PATH = os.getenv("DB_PATH", None)  # Path to database file (auto-determined if not set)
-DB_LEGACY_JSON_FALLBACK = os.getenv("DB_LEGACY_JSON_FALLBACK", "true").lower() == "true"  # Fallback to JSON if DB fails
+DB_LEGACY_JSON_FALLBACK = os.getenv("DB_LEGACY_JSON_FALLBACK", "false").lower() == "true"  # Legacy JSON fallback (disabled by default)
 
 # Backup directory for seed script
 BACKUP_DIRECTORY = os.getenv("BACKUP_DIRECTORY", "/Volumes/My Passport/telegram_media_backup")
 
 # Debug settings
 DEBUG = False  # Set to True for verbose logging
+
+# Rclone settings
+RCLONE_REMOTE_PATH = os.getenv("RCLONE_REMOTE_PATH", "").strip()
+RCLONE_BIN = os.getenv("RCLONE_BIN", "rclone").strip() or "rclone"
+RCLONE_FLAGS = os.getenv("RCLONE_FLAGS", "").strip()
+RCLONE_DEFAULT_OPERATION = os.getenv("RCLONE_DEFAULT_OPERATION", "copy").strip().lower()
+
+try:
+    RCLONE_AUTO_THRESHOLD_GB = float(os.getenv("RCLONE_AUTO_THRESHOLD_GB", "10"))
+    if RCLONE_AUTO_THRESHOLD_GB <= 0:
+        RCLONE_AUTO_THRESHOLD_GB = 10.0
+except (TypeError, ValueError):
+    RCLONE_AUTO_THRESHOLD_GB = 10.0
