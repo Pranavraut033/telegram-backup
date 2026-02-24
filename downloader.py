@@ -150,22 +150,45 @@ class MediaDownloader:
             int: Number of messages processed
         """
         message_processed_count = 0
-        if candidate_ids:
-            async for message in self._iter_messages_by_id(entity, candidate_ids):
-                message_processed_count += 1
+        if not candidate_ids:
+            return message_processed_count
 
+        async def process_single_message(message):
+            try:
                 if self.state_manager and self.state_manager.validate_downloaded_file(message.id):
                     log_debug(f"Skipping already downloaded message {message.id}")
                     self._update_progress(downloaded=1, advance=0)
-                    continue
-                
+                    return
+
                 if self.state_manager and self.state_manager.is_message_skipped(message.id):
                     log_debug(f"Skipping previously skipped message {message.id}")
                     self._update_progress(skipped=1, advance=0)
-                    continue
-                
+                    return
+
                 if self.media_filter.should_download(message):
                     await self._download_media(message, output_dir)
+            except Exception as e:
+                self.stats['errors'] += 1
+                log_debug(f"Unexpected processing error for message {message.id}: {e}")
+                if self.state_manager:
+                    self.state_manager.mark_failed(message.id)
+                self._update_progress(errors=1)
+
+        running_tasks = set()
+        async for message in self._iter_messages_by_id(entity, candidate_ids):
+            message_processed_count += 1
+
+            task = asyncio.create_task(process_single_message(message))
+            running_tasks.add(task)
+
+            if len(running_tasks) >= self.max_concurrent_downloads:
+                done, pending = await asyncio.wait(running_tasks, return_when=asyncio.FIRST_COMPLETED)
+                for done_task in done:
+                    await done_task
+                running_tasks = pending
+
+        if running_tasks:
+            await asyncio.gather(*running_tasks)
         
         return message_processed_count
 
@@ -259,18 +282,20 @@ class MediaDownloader:
             self.file_progress
         )
         return progress_group
-    def __init__(self, client, media_filter, output_dir, max_file_size=None, simple_mode=False):
+    def __init__(self, client, media_filter, output_dir, max_file_size=None, simple_mode=False, max_concurrent_downloads=3):
         self.client = client
         self.media_filter = media_filter
         self.output_dir = output_dir
         self.max_file_size = max_file_size  # in bytes, None = no limit
         self.simple_mode = simple_mode  # if True, use simple logging instead of progress bars
+        self.max_concurrent_downloads = max(1, int(max_concurrent_downloads or config.DEFAULT_DOWNLOAD_CONCURRENCY))
         self.state_manager = None
         self.progress_bar = None
         self.task_id = None
         self.overall_progress = None
         self.file_progress = None
         self.current_file_task = None
+        self._state_update_lock = None
         self.stats = {
             'downloaded': 0,
             'skipped': 0,
@@ -278,6 +303,12 @@ class MediaDownloader:
             'total_bytes': 0,
             'skipped_size': 0  # track files skipped due to size
         }
+
+    def _ensure_state_lock(self):
+        """Lazy-initialize async lock for state updates."""
+        if self._state_update_lock is None:
+            self._state_update_lock = asyncio.Lock()
+        return self._state_update_lock
     
     async def auto_rename_old_topic_folders(self, entity, chat_dir):
         """If chat is a forum, fetch topics and rename old topic folders automatically."""
@@ -501,17 +532,14 @@ class MediaDownloader:
         # Otherwise, generate a unique filepath (may have _1 if file exists but not valid)
         filepath = utils.get_unique_filepath(directory, filename)
 
-        def progress_callback(current, total):
-            if self.file_progress and self.current_file_task is not None:
-                self.file_progress.update(self.current_file_task, completed=current, total=total)
-
         while retries < config.MAX_RETRIES:
+            file_task_id = None
             try:
                 # Add file download task or log start
                 if self.simple_mode:
                     console.print(f"[cyan]📥 Downloading:[/cyan] {filename} (msg {message.id})")
                 elif self.file_progress:
-                    self.current_file_task = self.file_progress.add_task(
+                    file_task_id = self.file_progress.add_task(
                         filename,
                         total=0
                     )
@@ -519,6 +547,10 @@ class MediaDownloader:
                 # Log download attempt details
                 expected_size = self._get_media_size(message)
                 log_debug(f"Starting download to: {filepath}, expected size: {utils.format_bytes(expected_size) if expected_size else 'unknown'}")
+
+                def progress_callback(current, total):
+                    if self.file_progress and file_task_id is not None:
+                        self.file_progress.update(file_task_id, completed=current, total=total)
 
                 # Download media with progress callback
                 result = await self.client.download_media(
@@ -531,9 +563,9 @@ class MediaDownloader:
                 log_debug(f"Download result: {result if result else 'None/Failed'}")
 
                 # Remove file task after completion
-                if self.file_progress and self.current_file_task is not None:
-                    self.file_progress.remove_task(self.current_file_task)
-                    self.current_file_task = None
+                if self.file_progress and file_task_id is not None:
+                    self.file_progress.remove_task(file_task_id)
+                    file_task_id = None
 
                 if result:
                     actual_size = os.path.getsize(result) if os.path.exists(result) else 0
@@ -558,39 +590,76 @@ class MediaDownloader:
                     # Compute sample hash after successful download
                     sample_hash = utils.sample_hash_file(result) if actual_size > 0 else None
                     
-                    # Check if this file is a duplicate of an already downloaded file
+                    # Check if this file is a duplicate of an already downloaded file (local or remote)
                     if self.state_manager and sample_hash and actual_size > 0:
-                        existing_msg_id, existing_path = self.state_manager.find_duplicate(actual_size, sample_hash)
-                        
-                        if existing_msg_id and existing_path and os.path.exists(existing_path):
-                            # Found a duplicate! Remove the just-downloaded file and mark as duplicate
-                            # Determine if it's same chat or cross-chat duplicate
-                            if existing_msg_id == 'global':
-                                # Cross-chat duplicate
-                                chat_name = os.path.basename(os.path.dirname(existing_path))
-                                log_debug(f"Detected cross-chat duplicate: message {message.id} is duplicate of file in chat '{chat_name}'")
-                                os.remove(result)
-                                self.state_manager.mark_duplicate(message.id, f"global:{existing_path}")
-                                self.stats['skipped'] += 1
-                                if self.simple_mode:
-                                    console.print(f"[yellow]⊙ Duplicate:[/yellow] {filename} (exists in '{chat_name}')")
-                                self._update_progress(skipped=1)
-                            else:
-                                # Same chat duplicate
-                                log_debug(f"Detected duplicate: message {message.id} is duplicate of {existing_msg_id}")
-                                os.remove(result)
-                                self.state_manager.mark_duplicate(message.id, existing_msg_id)
-                                self.stats['skipped'] += 1
-                                if self.simple_mode:
-                                    console.print(f"[yellow]⊙ Duplicate:[/yellow] {filename} (same as message {existing_msg_id})")
-                                self._update_progress(skipped=1)
-                            return
-                    
-                    # Not a duplicate, mark as downloaded with hash
-                    self.stats['downloaded'] += 1
-                    self.stats['total_bytes'] += actual_size
-                    if self.state_manager:
-                        self.state_manager.mark_downloaded(message.id, result, actual_size, sample_hash=sample_hash)
+                        async with self._ensure_state_lock():
+                            existing_msg_id, existing_location = self.state_manager.find_duplicate(actual_size, sample_hash)
+
+                            if existing_msg_id and existing_location:
+                                # Found a duplicate! Remove the just-downloaded file and mark as duplicate
+                                
+                                # Handle location-aware duplicate info
+                                if isinstance(existing_location, dict):
+                                    # Location-aware duplicate (remote or both)
+                                    storage_status = existing_location.get('storage_status', 'unknown')
+                                    remote_path = existing_location.get('remote_path')
+                                    
+                                    if existing_msg_id == 'global':
+                                        # Cross-chat duplicate (remote or both)
+                                        log_debug(f"Detected cross-chat duplicate (remote): message {message.id} -> {remote_path or storage_status}")
+                                        os.remove(result)
+                                        self.state_manager.mark_duplicate(message.id, existing_location)
+                                        self.stats['skipped'] += 1
+                                        if self.simple_mode:
+                                            console.print(f"[yellow]⊙ Duplicate:[/yellow] {filename} (exists remotely in another chat)")
+                                        self._update_progress(skipped=1)
+                                    else:
+                                        # Same chat duplicate (remote or both)
+                                        log_debug(f"Detected duplicate (remote): message {message.id} is duplicate of {existing_msg_id}")
+                                        os.remove(result)
+                                        self.state_manager.mark_duplicate(message.id, existing_msg_id)
+                                        self.stats['skipped'] += 1
+                                        if self.simple_mode:
+                                            console.print(f"[yellow]⊙ Duplicate:[/yellow] {filename} (remote duplicate of message {existing_msg_id})")
+                                        self._update_progress(skipped=1)
+                                    return
+                                
+                                elif isinstance(existing_location, str):
+                                    # String path - local file
+                                    if os.path.exists(existing_location):
+                                        # Determine if it's same chat or cross-chat duplicate
+                                        if existing_msg_id == 'global':
+                                            # Cross-chat duplicate
+                                            chat_name = os.path.basename(os.path.dirname(existing_location))
+                                            log_debug(f"Detected cross-chat duplicate: message {message.id} is duplicate of file in chat '{chat_name}'")
+                                            os.remove(result)
+                                            self.state_manager.mark_duplicate(message.id, f"global:{existing_location}")
+                                            self.stats['skipped'] += 1
+                                            if self.simple_mode:
+                                                console.print(f"[yellow]⊙ Duplicate:[/yellow] {filename} (exists in '{chat_name}')")
+                                            self._update_progress(skipped=1)
+                                        else:
+                                            # Same chat duplicate
+                                            log_debug(f"Detected duplicate: message {message.id} is duplicate of {existing_msg_id}")
+                                            os.remove(result)
+                                            self.state_manager.mark_duplicate(message.id, existing_msg_id)
+                                            self.stats['skipped'] += 1
+                                            if self.simple_mode:
+                                                console.print(f"[yellow]⊙ Duplicate:[/yellow] {filename} (same as message {existing_msg_id})")
+                                            self._update_progress(skipped=1)
+                                        return
+
+                            # Not a duplicate, mark as downloaded with hash
+                            self.stats['downloaded'] += 1
+                            self.stats['total_bytes'] += actual_size
+                            self.state_manager.mark_downloaded(message.id, result, actual_size, sample_hash=sample_hash)
+                    else:
+                        # Not a duplicate-checking path, still count as downloaded
+                        self.stats['downloaded'] += 1
+                        self.stats['total_bytes'] += actual_size
+                        if self.state_manager:
+                            self.state_manager.mark_downloaded(message.id, result, actual_size, sample_hash=sample_hash)
+
                     log_debug(f"Successfully downloaded: {filename} ({utils.format_bytes(actual_size)})")
                     if self.simple_mode:
                         console.print(f"[green]✓ Downloaded:[/green] {filename} ({utils.format_bytes(actual_size)})")
@@ -606,17 +675,17 @@ class MediaDownloader:
             except FloodWaitError as e:
                 wait_time = e.seconds
                 log_debug(f"Rate limited. Waiting {wait_time}s...")
-                if self.file_progress and self.current_file_task is not None:
-                    self.file_progress.remove_task(self.current_file_task)
-                    self.current_file_task = None
+                if self.file_progress and file_task_id is not None:
+                    self.file_progress.remove_task(file_task_id)
+                    file_task_id = None
                 await asyncio.sleep(wait_time)
                 retries += 1
 
             except Exception as e:
                 error_msg = str(e)
-                if self.file_progress and self.current_file_task is not None:
-                    self.file_progress.remove_task(self.current_file_task)
-                    self.current_file_task = None
+                if self.file_progress and file_task_id is not None:
+                    self.file_progress.remove_task(file_task_id)
+                    file_task_id = None
 
                 if "FILE_REFERENCE" in error_msg:
                     self.stats['skipped'] += 1
