@@ -31,6 +31,13 @@ CLI tool for backing up media from Telegram chats and groups using the Telegram 
 python main.py
 ```
 
+Running `python main.py` now opens a menu with:
+- Start backup
+- Start backup with auto cloud transfer (rclone copy/move after cumulative threshold)
+- Copy local backup to cloud
+- Move local backup to cloud
+- Sync local backup to cloud
+
 ### Command-Line Options
 
 ```bash
@@ -58,7 +65,29 @@ python main.py --signout
 # Find and consolidate duplicate files
 python main.py --consolidate-duplicates /path/to/backup
 python main.py --find-duplicates /path/to/backup
+
+# Sync state from filesystem and cloud (after rclone move/copy)
+python main.py --sync-state /path/to/backup --remote myremote:telegram-backup
+python main.py --sync-state /path/to/backup --remote myremote:backup --dry-run
 ```
+
+### Cloud-Aware Resume
+
+After moving files to cloud storage (e.g., via `rclone move`), you can sync your state database to track both local and remote file locations:
+
+```bash
+# Sync state from local filesystem and rclone remote
+python main.py --sync-state ./telegram_media_backup --remote myremote:telegram-backup
+
+# The tool will now skip downloading files that exist in either location
+python main.py  # Resume backup without re-downloading
+```
+
+This enables efficient backup workflows:
+1. Backup to local storage
+2. Move/copy files to cloud with rclone
+3. Sync state to track remote locations
+4. Continue backing up without re-downloading files already in cloud
 
 ### Migration Script
 
@@ -125,6 +154,24 @@ or see [help.txt](help.txt)
    - Displays current file being processed with timestamps.
    - Includes a detailed summary at the end.
    - Use `--simple` mode to disable progress bars for logging to file
+
+### Rclone Cloud Transfer
+
+Set these in `.env`:
+
+```dotenv
+RCLONE_REMOTE_PATH=myremote:telegram-backup
+RCLONE_AUTO_THRESHOLD_GB=10
+RCLONE_BIN=rclone
+RCLONE_FLAGS=
+RCLONE_DEFAULT_OPERATION=copy
+```
+
+Notes:
+- `Start backup with auto cloud transfer` tracks cumulative downloaded bytes across runs.
+- When cumulative bytes reach the threshold, it triggers one transfer and resets the counter to 0.
+- You can override remote path and choose copy/move per run from the menu.
+- `Sync` is one-way local → remote (`rclone sync`).
 
 ---
 

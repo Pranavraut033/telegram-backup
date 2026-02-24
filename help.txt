@@ -10,6 +10,16 @@ DESCRIPTION:
 USAGE:
   python main.py [OPTIONS]
 
+MENU MODE:
+  Running without options opens a menu:
+  1) Start backup
+  2) Start backup with auto cloud transfer (threshold-based)
+  3) Copy local backup to cloud (rclone copy)
+  4) Move local backup to cloud (rclone move)
+  5) Sync local backup to cloud (rclone sync)
+  6) Generate/sync state from filesystem + remote
+  7) Exit
+
 OPTIONS:
   -h, --help              Show this help message and exit
   -v, --debug, --verbose  Enable debug mode with verbose logging output
@@ -20,6 +30,11 @@ OPTIONS:
   --find-duplicates <DIR> Find and consolidate duplicate files in backup folder
                           Moves duplicate files to 'duplicates' subfolder while
                           preserving folder structure. Space-saving utility.
+  --sync-state <DIR>      Scan local filesystem and rclone remote to rebuild
+                          or update the state database. Enables cloud-aware
+                          resume after files have been moved to remote storage.
+                          Usage: python main.py --sync-state /path/to/backup
+                                 [--remote myremote:path] [--dry-run]
   
 INTERACTIVE PROMPTS:
   After starting with 'python main.py', you'll be prompted for:
@@ -57,13 +72,26 @@ INTERACTIVE PROMPTS:
 
 FEATURES:
   ✓ Resume capability    - Resume interrupted backups
+  ✓ Cloud-aware resume   - Skip files already in cloud storage
   ✓ Progress tracking    - Visual progress bars with live stats
   ✓ Smart caching        - Message lists cached for speed
   ✓ Forum support        - Backs up from forum topics
-  ✓ State management     - Tracks downloads and validates integrity
+  ✓ State management     - Tracks downloads (local and remote)
   ✓ Flexible filtering   - By date, file size, media type
   ✓ Error recovery       - Automatic retry on failures
+  ✓ Duplicate detection  - Hash-based deduplication across chats
   ✓ Multiple media types - Photos, videos, audio, documents, etc.
+
+CLOUD WORKFLOW:
+  1. Initial backup to local storage
+  2. Move/copy files to cloud with rclone
+  3. Run --sync-state to update database with remote locations
+  4. Resume backup without re-downloading files already in cloud
+  
+  The tool tracks files in three states:
+  - 'local': File exists only on local disk
+  - 'remote': File exists only in cloud storage
+  - 'both': File exists in both locations
 
 EXAMPLES:
 
@@ -84,6 +112,12 @@ EXAMPLES:
 
   # Logout and start fresh (clears session)
   python main.py --logout
+  
+  # Sync state after moving files to cloud
+  python main.py --sync-state ./telegram_media_backup --remote myremote:telegram-backup
+  
+  # Dry run to see what would be synced
+  python main.py --sync-state ./telegram_media_backup --remote myremote:backup --dry-run
 
 ENVIRONMENT VARIABLES:
   These can be set in .env file:
@@ -95,14 +129,20 @@ ENVIRONMENT VARIABLES:
   DEFAULT_OUTPUT_DIR  - Default backup directory
   DEFAULT_MESSAGE_LIMIT - Default message scan limit
   LAST_CONFIG_FILE    - File to store last used settings
+  RCLONE_REMOTE_PATH  - Default rclone remote destination (e.g., remote:bucket/path)
+  RCLONE_AUTO_THRESHOLD_GB - Auto-transfer threshold in GB (default: 10)
+  RCLONE_BIN          - rclone binary name/path (default: rclone)
+  RCLONE_FLAGS        - Extra flags appended to rclone commands
+  RCLONE_DEFAULT_OPERATION - Default auto-transfer mode: copy or move
 
 FILES & FOLDERS:
   telegram_backup_session.session     - Session file (created after login)
+  telegram_backup.db                 - State database (SQLite, default backend)
   .env                               - Configuration file (create from .env.example)
   .last_backup_config.json           - Remembers last used settings
   telegram_media_backup/             - Default output directory
     chat_name/                       - Backup for each chat
-      .backup_state_*.json           - Download progress tracking
+      .backup_state_*.json           - Download progress (JSON backend, legacy)
       .message_cache_*.json          - Cached message lists
       media files...                 - Downloaded media files
 
@@ -132,6 +172,10 @@ TROUBLESHOOTING:
 
   Q: Out of memory with large backups
   A: Restart the backup - it will resume from where it left off
+  
+  Q: Files moved to cloud, how to avoid re-downloading?
+  A: Run state sync first: python main.py --sync-state /path/to/backup --remote myremote:path
+     Then backup will skip files already in cloud storage
 
 MORE INFORMATION:
   GitHub: https://github.com/Pranavraut033/telegram-backup
