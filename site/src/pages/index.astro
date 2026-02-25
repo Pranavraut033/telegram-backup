@@ -1,0 +1,110 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Section from '../components/Section.astro';
+import FeatureCard from '../components/FeatureCard.astro';
+
+const features = [
+  {
+    title: 'Telegram media backup via CLI',
+    text: 'Back up media from chats, groups, and topics with date and type filters from a single command-line flow.',
+  },
+  {
+    title: 'Duplicate-aware downloads',
+    text: 'Content hashing and state tracking prevent redundant downloads, including cross-chat duplicate detection.',
+  },
+  {
+    title: 'Cloud-aware resume support',
+    text: 'Sync local and remote backup state so resumed runs skip files already present in cloud storage.',
+  },
+  {
+    title: 'Binary releases for all major OSes',
+    text: 'GitHub Actions builds standalone executables for macOS, Linux, and Windows.',
+  },
+];
+
+const commands = [
+  'telegram-backup --help',
+  'telegram-backup',
+  'telegram-backup --debug',
+  'telegram-backup --consolidate-duplicates /path/to/backup',
+  'telegram-backup --sync-state ./telegram_media_backup --remote myremote:telegram-backup',
+];
+---
+
+<BaseLayout
+  title="Telegram Backup | Binary-first Telegram media backup"
+  description="CLI tool for backing up Telegram media with duplicate detection, cloud-aware resume, and binary downloads."
+>
+  <header class="rounded-2xl border border-indigo-500/30 bg-gradient-to-b from-indigo-600/30 to-slate-900 p-8 md:p-10">
+    <p class="text-xs font-semibold uppercase tracking-[0.2em] text-indigo-200">Telegram Backup</p>
+    <h1 class="mt-3 text-3xl font-bold tracking-tight text-white md:text-5xl">Publish-ready Telegram media backups, built for reliability.</h1>
+    <p class="mt-4 max-w-3xl text-base leading-7 text-slate-200 md:text-lg">
+      A CLI tool to archive media from Telegram chats and groups with robust duplicate detection, stateful resume,
+      and cloud-sync-aware workflows.
+    </p>
+
+    <div class="mt-8 flex flex-wrap gap-4">
+      <a
+        class="rounded-lg bg-indigo-500 px-5 py-3 text-sm font-semibold text-white transition hover:bg-indigo-400"
+        href="https://github.com/Pranavraut033/telegram-backup/releases"
+        target="_blank"
+        rel="noreferrer"
+      >
+        Download binaries
+      </a>
+      <a
+        class="rounded-lg border border-slate-700 px-5 py-3 text-sm font-semibold text-slate-100 transition hover:border-slate-500"
+        href="https://github.com/Pranavraut033/telegram-backup"
+        target="_blank"
+        rel="noreferrer"
+      >
+        View source
+      </a>
+    </div>
+  </header>
+
+  <div class="mt-8 grid gap-8">
+    <Section title="Key features" subtitle="Focused scope, practical CLI flow, and safe resume behavior.">
+      <div class="grid gap-4 md:grid-cols-2">
+        {features.map((feature) => <FeatureCard title={feature.title} text={feature.text} />)}
+      </div>
+    </Section>
+
+    <Section title="Quickstart" subtitle="Primary path: use GitHub release binaries.">
+      <ol class="list-decimal space-y-3 pl-5 text-slate-200">
+        <li>Download the latest binary from GitHub Releases for your platform.</li>
+        <li>Create a <code class="rounded bg-slate-800 px-2 py-1 text-slate-100">.env</code> file from <code class="rounded bg-slate-800 px-2 py-1 text-slate-100">.env.example</code>.</li>
+        <li>Set <code class="rounded bg-slate-800 px-2 py-1 text-slate-100">API_ID</code> and <code class="rounded bg-slate-800 px-2 py-1 text-slate-100">API_HASH</code>.</li>
+        <li>Run the tool and follow the interactive chat/media selection flow.</li>
+      </ol>
+      <p class="mt-4 text-sm text-slate-400">
+        Source-run fallback is documented in the repository README.
+      </p>
+    </Section>
+
+    <Section title="Core commands" subtitle="Command behavior mirrors the CLI documentation.">
+      <div class="overflow-x-auto rounded-lg border border-slate-800 bg-slate-950 p-4">
+        <pre class="text-sm text-slate-200"><code>{commands.join('\n')}</code></pre>
+      </div>
+    </Section>
+
+    <Section title="Safety and legal" subtitle="Use responsibly and only where you have rights and permission.">
+      <ul class="list-disc space-y-2 pl-5 text-slate-200">
+        <li>Never commit credentials such as <code class="rounded bg-slate-800 px-2 py-1 text-slate-100">API_ID</code> and <code class="rounded bg-slate-800 px-2 py-1 text-slate-100">API_HASH</code>.</li>
+        <li>Follow Telegram terms and local laws for data retention and export.</li>
+        <li>Protect backup data at rest and in cloud storage using your own security controls.</li>
+      </ul>
+    </Section>
+
+    <Section title="Docs and links">
+      <div class="grid gap-3 text-sm text-slate-200 md:grid-cols-2">
+        <a class="rounded-lg border border-slate-700 p-3 transition hover:border-slate-500" href="https://github.com/Pranavraut033/telegram-backup#readme" target="_blank" rel="noreferrer">README</a>
+        <a class="rounded-lg border border-slate-700 p-3 transition hover:border-slate-500" href="https://github.com/Pranavraut033/telegram-backup/blob/main/DUPLICATE_DETECTION.md" target="_blank" rel="noreferrer">Duplicate detection guide</a>
+        <a class="rounded-lg border border-slate-700 p-3 transition hover:border-slate-500" href="https://github.com/Pranavraut033/telegram-backup/blob/main/CROSS_CHAT_DUPLICATES.md" target="_blank" rel="noreferrer">Cross-chat duplicate docs</a>
+        <a class="rounded-lg border border-slate-700 p-3 transition hover:border-slate-500" href="https://github.com/Pranavraut033/telegram-backup/blob/main/SQL_MIGRATION_GUIDE.md" target="_blank" rel="noreferrer">SQLite migration guide</a>
+        <a class="rounded-lg border border-slate-700 p-3 transition hover:border-slate-500" href="https://github.com/Pranavraut033/telegram-backup/blob/main/CLOUD_AWARE_RESUME.md" target="_blank" rel="noreferrer">Cloud-aware resume</a>
+        <a class="rounded-lg border border-slate-700 p-3 transition hover:border-slate-500" href="https://github.com/Pranavraut033/telegram-backup/issues" target="_blank" rel="noreferrer">Issue tracker</a>
+      </div>
+    </Section>
+  </div>
+</BaseLayout>
