@@ -3,15 +3,30 @@
 
 name: Build Executable
 
+permissions:
+  contents: write
+
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag name to release (for example: v1.2.3)'
+        required: true
+        type: string
 
 jobs:
   build:
     runs-on: ${{ matrix.os }}
+    env:
+      APPLE_IDENTITY_P12: ${{ secrets.APPLE_IDENTITY_P12 }}
+      APPLE_IDENTITY_P12_PASSWORD: ${{ secrets.APPLE_IDENTITY_P12_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
     strategy:
       matrix:
         include:
@@ -36,12 +51,8 @@ jobs:
         run: |
           pyinstaller --onefile main.py --name telegram-backup --add-data "help.txt${{ matrix.add_data_sep }}."
 
-      - name: macOS: Code sign
-        if: matrix.os == 'macos-latest'
-        env:
-          APPLE_IDENTITY_P12: ${{ secrets.APPLE_IDENTITY_P12 }}
-          APPLE_IDENTITY_P12_PASSWORD: ${{ secrets.APPLE_IDENTITY_P12_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      - name: "macOS: Code sign"
+        if: matrix.os == 'macos-latest' && env.APPLE_IDENTITY_P12 != '' && env.APPLE_IDENTITY_P12_PASSWORD != '' && env.APPLE_SIGNING_IDENTITY != ''
         run: |
           set -euo pipefail
           echo "Preparing keychain and importing identity..."
@@ -58,12 +69,8 @@ jobs:
           codesign --timestamp --options runtime --sign "$APPLE_SIGNING_IDENTITY" dist/telegram-backup || true
           spctl -a -vvv dist/telegram-backup || true
 
-      - name: macOS: Notarize and staple
-        if: matrix.os == 'macos-latest'
-        env:
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+      - name: "macOS: Notarize and staple"
+        if: matrix.os == 'macos-latest' && env.APPLE_API_KEY_ID != '' && env.APPLE_API_ISSUER_ID != '' && env.APPLE_API_PRIVATE_KEY != ''
         run: |
           set -euo pipefail
           echo "Preparing API key for notarytool..."
@@ -88,7 +95,7 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     steps:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
@@ -103,10 +110,30 @@ jobs:
             exit 1
           fi
 
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+
+          while IFS= read -r file; do
+            artifact_dir=$(basename "$(dirname "$file")")
+            os_name=${artifact_dir#telegram-backup-}
+            base=$(basename "$file")
+
+            if [[ "$base" == *.exe ]]; then
+              out="release-assets/telegram-backup-${os_name}.exe"
+            else
+              out="release-assets/telegram-backup-${os_name}"
+            fi
+
+            cp "$file" "$out"
+            echo "Prepared $out"
+          done < <(find dist -type f -name 'telegram-backup*' | sort)
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          files: dist/**/telegram-backup*
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
