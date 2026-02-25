@@ -23,6 +23,14 @@ import utils
 
 console = Console()
 
+def get_resource_path(relative_path):
+    """Get absolute path to bundled or source resource."""
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        base_path = sys._MEIPASS
+    else:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
 class TelegramMediaBackup:
     def __init__(
         self,
@@ -404,7 +412,7 @@ class TelegramMediaBackup:
 def print_help():
     """Display help message from help.txt file"""
     try:
-        help_file = os.path.join(os.path.dirname(__file__), 'help.txt')
+        help_file = get_resource_path('help.txt')
         with open(help_file, 'r', encoding='utf-8') as f:
             help_text = f.read()
         print(help_text)
