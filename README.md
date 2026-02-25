@@ -4,9 +4,28 @@
 
 CLI tool for backing up media from Telegram chats and groups using the Telegram Client API.
 
+Project website (Astro): https://pranavraut033.github.io/telegram-backup
+
 ---
 
 ## Setup
+
+### Option A (recommended): Use GitHub release binaries
+
+1. Download the latest executable for your platform from [Releases](https://github.com/Pranavraut033/telegram-backup/releases)
+2. Copy `.env.example` to `.env` and set your Telegram API credentials
+3. Run the executable:
+
+```bash
+# macOS / Linux
+chmod +x telegram-backup
+./telegram-backup --help
+
+# Windows
+telegram-backup.exe --help
+```
+
+### Option B: Run from source
 
 1. **Install dependencies:**
    ```bash
@@ -113,6 +132,21 @@ See [MIGRATION_SCRIPT.md](MIGRATION_SCRIPT.md) for detailed instructions.
 - [CROSS_CHAT_DUPLICATES.md](CROSS_CHAT_DUPLICATES.md) - How cross-chat duplicate detection works
 - [QUICK_START_DUPLICATES.md](QUICK_START_DUPLICATES.md) - Quick reference guide
 - [MIGRATION_SCRIPT.md](MIGRATION_SCRIPT.md) - Migration script usage and details
+- [CONTRIBUTING.md](CONTRIBUTING.md) - Contribution guidelines
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) - Community standards
+- [SECURITY.md](SECURITY.md) - Vulnerability reporting and security policy
+
+### Website
+
+This repository includes a small Astro + Tailwind showcase site in `site/`.
+
+```bash
+cd site
+npm install
+npm run dev
+```
+
+The site is deployed via GitHub Pages using `.github/workflows/pages.yml`.
 
 For more detailed help and examples, run:
 ```bash
